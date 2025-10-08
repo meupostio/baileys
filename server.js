@@ -1,4 +1,10 @@
-// baileys-server-multiuser.js
+// ============================================
+// SERVIDOR BAILEYS MULTI-USUÁRIO V2
+// ============================================
+// Este servidor suporta múltiplas sessões simultâneas
+// por user_id (não por número de telefone)
+// ============================================
+
 import express from 'express';
 import makeWASocket, {
   useMultiFileAuthState,
@@ -17,7 +23,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || 'sua-chave-api-aqui';
+const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 
 // Logger configurado
@@ -32,7 +38,9 @@ const logger = pino({
 // Armazena as sessões ativas por user_id
 const sessions = new Map();
 
-// Middleware de autenticação
+// ============================================
+// MIDDLEWARE DE AUTENTICAÇÃO
+// ============================================
 const authenticate = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   if (!apiKey || apiKey !== API_KEY) {
@@ -41,12 +49,11 @@ const authenticate = (req, res, next) => {
   next();
 };
 
-// Aplica autenticação em todas as rotas
 app.use(authenticate);
 
-/**
- * Obtém ou cria dados da sessão
- */
+// ============================================
+// FUNÇÃO: Obter ou criar sessão
+// ============================================
 function getOrCreateSession(sessionId) {
   if (!sessions.has(sessionId)) {
     sessions.set(sessionId, {
@@ -63,9 +70,9 @@ function getOrCreateSession(sessionId) {
   return sessions.get(sessionId);
 }
 
-/**
- * Envia webhook para Supabase
- */
+// ============================================
+// FUNÇÃO: Enviar webhook para Supabase
+// ============================================
 async function sendWebhook(type, data, sessionId) {
   if (!WEBHOOK_URL) {
     logger.warn('WEBHOOK_URL não configurado');
@@ -89,13 +96,13 @@ async function sendWebhook(type, data, sessionId) {
       });
 
       if (response.ok) {
-        logger.info(`Webhook enviado: ${type} (${sessionId})`);
+        logger.info(`✅ Webhook enviado: ${type} (${sessionId})`);
         return;
       }
 
-      logger.warn(`Webhook falhou (tentativa ${attempt}/${maxRetries}): ${response.status}`);
+      logger.warn(`⚠️ Webhook falhou (tentativa ${attempt}/${maxRetries}): ${response.status}`);
     } catch (error) {
-      logger.error(`Erro no webhook (tentativa ${attempt}/${maxRetries}):`, error.message);
+      logger.error(`❌ Erro no webhook (tentativa ${attempt}/${maxRetries}):`, error.message);
     }
 
     if (attempt < maxRetries) {
@@ -104,14 +111,14 @@ async function sendWebhook(type, data, sessionId) {
   }
 }
 
-/**
- * Limpa sessão antiga completamente
- */
+// ============================================
+// FUNÇÃO: Limpar sessão completamente
+// ============================================
 async function cleanupSession(sessionId) {
   const session = sessions.get(sessionId);
   
   if (session) {
-    logger.info(`Limpando sessão: ${sessionId}`);
+    logger.info(`🧹 Limpando sessão: ${sessionId}`);
     
     // Fecha socket se existir
     if (session.socket) {
@@ -136,24 +143,24 @@ async function cleanupSession(sessionId) {
   if (fs.existsSync(authPath)) {
     try {
       fs.rmSync(authPath, { recursive: true, force: true });
-      logger.info(`Pasta de auth removida: ${authPath}`);
+      logger.info(`📁 Pasta de auth removida: ${authPath}`);
     } catch (e) {
-      logger.error(`Erro ao remover pasta de auth: ${e.message}`);
+      logger.error(`❌ Erro ao remover pasta de auth: ${e.message}`);
     }
   }
 }
 
-/**
- * Cria conexão WhatsApp
- */
+// ============================================
+// FUNÇÃO: Criar conexão WhatsApp
+// ============================================
 async function createWhatsAppConnection(sessionId, options = {}) {
-  const session = getOrCreateSession(sessionId);
+  let session = getOrCreateSession(sessionId);
   
-  logger.info(`Iniciando conexão para sessão: ${sessionId}`);
+  logger.info(`🔌 Iniciando conexão para sessão: ${sessionId}`);
   
   // Limpa sessão antiga se existir
   if (session.socket) {
-    logger.info('Fechando socket anterior...');
+    logger.info('🔄 Fechando socket anterior...');
     try {
       await session.socket.logout();
     } catch (e) {
@@ -194,11 +201,13 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     session.qr = null;
     session.lastQrTime = Date.now();
     
-    // Event: connection.update
+    // ============================================
+    // EVENT: connection.update
+    // ============================================
     socket.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
       
-      logger.info(`[${sessionId}] Connection update:`, {
+      logger.info(`[${sessionId}] 🔄 Connection update:`, {
         connection,
         hasQr: !!qr,
         reason: lastDisconnect?.error?.message,
@@ -210,11 +219,11 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           session.qr = await qrcode.toDataURL(qr);
           session.status = 'qr_ready';
           session.lastQrTime = Date.now();
-          logger.info(`[${sessionId}] QR Code gerado`);
+          logger.info(`[${sessionId}] 📱 QR Code gerado`);
           
           await sendWebhook('qr', { qr: session.qr }, sessionId);
         } catch (err) {
-          logger.error(`[${sessionId}] Erro ao gerar QR:`, err);
+          logger.error(`[${sessionId}] ❌ Erro ao gerar QR:`, err);
         }
       }
       
@@ -228,18 +237,23 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         
         logger.info(`[${sessionId}] ✅ Conectado! Phone: ${phone}`);
         
-        await sendWebhook('connected', { phone }, sessionId);
+        await sendWebhook('status-updated', { 
+          connected: true,
+          status: 'connected',
+          phone: { number: phone }
+        }, sessionId);
       }
       
       // Desconectado
       if (connection === 'close') {
-        const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+        const shouldReconnect = (lastDisconnect?.error instanceof Boom) && 
+          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
         
-        logger.warn(`[${sessionId}] Desconectado. Reconectar: ${shouldReconnect}`);
+        logger.warn(`[${sessionId}] ⚠️ Desconectado. Reconectar: ${shouldReconnect}`);
         
         if (shouldReconnect && session.retryCount < 3) {
           session.retryCount++;
-          logger.info(`[${sessionId}] Tentando reconectar (${session.retryCount}/3)...`);
+          logger.info(`[${sessionId}] 🔄 Tentando reconectar (${session.retryCount}/3)...`);
           setTimeout(() => createWhatsAppConnection(sessionId), 5000);
         } else {
           session.status = 'disconnected';
@@ -247,37 +261,46 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           session.qr = null;
           session.phone = null;
           
-          await sendWebhook('disconnected', {}, sessionId);
+          await sendWebhook('status-updated', {
+            connected: false,
+            status: 'disconnected'
+          }, sessionId);
         }
       }
     });
     
-    // Event: creds.update
+    // ============================================
+    // EVENT: creds.update
+    // ============================================
     socket.ev.on('creds.update', saveCreds);
     
-    // Event: messages.upsert
+    // ============================================
+    // EVENT: messages.upsert
+    // ============================================
     socket.ev.on('messages.upsert', async ({ messages }) => {
       for (const message of messages) {
         if (!message.message) continue;
         
-        logger.info(`[${sessionId}] Nova mensagem:`, {
+        logger.info(`[${sessionId}] 💬 Nova mensagem:`, {
           from: message.key.remoteJid,
           id: message.key.id,
         });
         
-        await sendWebhook('message', {
-          messageId: message.key.id,
-          from: message.key.remoteJid,
-          fromMe: message.key.fromMe,
-          message: message.message,
-          timestamp: message.messageTimestamp,
+        await sendWebhook('received-message', {
+          instanceId: sessionId,
+          data: {
+            key: message.key,
+            message: message.message,
+            messageTimestamp: message.messageTimestamp,
+            pushName: message.pushName,
+          }
         }, sessionId);
       }
     });
     
     return socket;
   } catch (error) {
-    logger.error(`[${sessionId}] Erro ao criar conexão:`, error);
+    logger.error(`[${sessionId}] ❌ Erro ao criar conexão:`, error);
     session.status = 'error';
     session.socket = null;
     throw error;
@@ -301,7 +324,7 @@ app.post('/create-session', async (req, res) => {
       return res.status(400).json({ error: 'session ou sessionId obrigatório' });
     }
     
-    logger.info(`POST /create-session → ${finalSessionId}`, { force, fresh });
+    logger.info(`📥 POST /create-session → ${finalSessionId}`, { force, fresh });
     
     await createWhatsAppConnection(finalSessionId, { force, fresh });
     
@@ -322,7 +345,7 @@ app.post('/create-session', async (req, res) => {
       sessionId: finalSessionId,
     });
   } catch (error) {
-    logger.error('Erro em /create-session:', error);
+    logger.error('❌ Erro em /create-session:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -355,7 +378,7 @@ app.get('/sessions/:sessionId/qrcode', (req, res) => {
 
 /**
  * GET /qrcode
- * Retorna QR code da primeira sessão disponível
+ * Retorna QR code da primeira sessão disponível ou específica
  */
 app.get('/qrcode', (req, res) => {
   const sessionId = req.query.sessionId;
@@ -429,14 +452,14 @@ app.delete('/sessions/:sessionId', async (req, res) => {
   try {
     const { sessionId } = req.params;
     
-    logger.info(`DELETE /sessions/${sessionId}`);
+    logger.info(`🗑️ DELETE /sessions/${sessionId}`);
     
     await cleanupSession(sessionId);
     sessions.delete(sessionId);
     
     res.json({ success: true, message: 'Sessão removida' });
   } catch (error) {
-    logger.error('Erro em DELETE /sessions:', error);
+    logger.error('❌ Erro em DELETE /sessions:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -454,7 +477,7 @@ app.post('/sessions/:sessionId/disconnect', async (req, res) => {
       return res.status(404).json({ error: 'Sessão não encontrada' });
     }
     
-    logger.info(`POST /sessions/${sessionId}/disconnect`);
+    logger.info(`🔌 POST /sessions/${sessionId}/disconnect`);
     
     if (session.socket) {
       await session.socket.logout();
@@ -465,13 +488,49 @@ app.post('/sessions/:sessionId/disconnect', async (req, res) => {
     session.qr = null;
     session.phone = null;
     
-    await sendWebhook('disconnected', {}, sessionId);
+    await sendWebhook('status-updated', {
+      connected: false,
+      status: 'disconnected'
+    }, sessionId);
     
     res.json({ success: true, message: 'Sessão desconectada' });
   } catch (error) {
-    logger.error('Erro em POST /disconnect:', error);
+    logger.error('❌ Erro em POST /disconnect:', error);
     res.status(500).json({ error: error.message });
   }
+});
+
+/**
+ * POST /disconnect
+ * Alias para /sessions/:sessionId/disconnect (compatibilidade)
+ */
+app.post('/disconnect', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId obrigatório' });
+    }
+    
+    req.params.sessionId = sessionId;
+    return app._router.handle(req, res);
+  } catch (error) {
+    logger.error('❌ Erro em POST /disconnect:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * DELETE /session/:sessionId?
+ * Alias para /sessions/:sessionId (compatibilidade)
+ */
+app.delete('/session/:sessionId?', async (req, res) => {
+  const sessionId = req.params.sessionId || 'default';
+  req.params.sessionId = sessionId;
+  
+  await cleanupSession(sessionId);
+  sessions.delete(sessionId);
+  
+  res.json({ success: true, message: 'Sessão removida' });
 });
 
 /**
@@ -480,10 +539,17 @@ app.post('/sessions/:sessionId/disconnect', async (req, res) => {
  */
 app.post('/send-message', async (req, res) => {
   try {
-    const { sessionId, to, message } = req.body;
+    const { sessionId, to, phone, message, text } = req.body;
     
-    if (!sessionId || !to || !message) {
-      return res.status(400).json({ error: 'sessionId, to e message são obrigatórios' });
+    if (!sessionId) {
+      return res.status(400).json({ error: 'sessionId obrigatório' });
+    }
+    
+    const recipient = to || phone;
+    const content = message || text;
+    
+    if (!recipient || !content) {
+      return res.status(400).json({ error: 'destinatário e mensagem são obrigatórios' });
     }
     
     const session = sessions.get(sessionId);
@@ -492,11 +558,11 @@ app.post('/send-message', async (req, res) => {
       return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
     }
     
-    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    const jid = recipient.includes('@') ? recipient : `${recipient}@s.whatsapp.net`;
     
-    const result = await session.socket.sendMessage(jid, { text: message });
+    const result = await session.socket.sendMessage(jid, { text: content });
     
-    logger.info(`Mensagem enviada: ${sessionId} → ${to}`);
+    logger.info(`✉️ Mensagem enviada: ${sessionId} → ${recipient}`);
     
     res.json({
       success: true,
@@ -504,7 +570,7 @@ app.post('/send-message', async (req, res) => {
       to: jid,
     });
   } catch (error) {
-    logger.error('Erro em /send-message:', error);
+    logger.error('❌ Erro em /send-message:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -517,9 +583,11 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// Inicia o servidor
+// ============================================
+// SERVIDOR
+// ============================================
 app.listen(PORT, () => {
-  logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
+  logger.info(`🚀 Servidor Baileys Multi-usuário V2 rodando na porta ${PORT}`);
   logger.info(`🔐 API Key configurada: ${API_KEY ? 'Sim' : 'Não'}`);
   logger.info(`🔗 Webhook URL: ${WEBHOOK_URL || 'Não configurado'}`);
 });
