@@ -1,59 +1,49 @@
-// ============================================
-// SERVIDOR BAILEYS MULTI-USUÁRIO V2
-// ============================================
-// Este servidor suporta múltiplas sessões simultâneas
-// por user_id (não por número de telefone)
-// ============================================
-
-import express from 'express';
-import makeWASocket, {
+// serve.js
+const express = require('express');
+const pino = require('pino');
+const qrcode = require('qrcode');
+const fs = require('fs');
+const path = require('path');
+const { Boom } = require('@hapi/boom');
+const {
+  default: makeWASocket,
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
-} from '@whiskeysockets/baileys';
-import pino from 'pino';
-import qrcode from 'qrcode';
-import fs from 'fs';
-import path from 'path';
-import { Boom } from '@hapi/boom';
+} = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || 'your-secret-key-here';
+const API_KEY = process.env.API_KEY || '';
 const WEBHOOK_URL = process.env.WEBHOOK_URL || '';
 
-// Logger configurado
-const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport: {
-    target: 'pino-pretty',
-    options: { colorize: true }
-  }
-});
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
-// Armazena as sessões ativas por user_id
+// Armazena as sessões ativas por sessionId (use o user_id aqui)
 const sessions = new Map();
 
-// ============================================
-// MIDDLEWARE DE AUTENTICAÇÃO
-// ============================================
-const authenticate = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== API_KEY) {
+// Middleware simples de API Key
+function authenticate(req, res, next) {
+  const apiKey = req.headers['x-api-key'] || req.headers['api-key'] || req.headers['authorization'];
+  if (!API_KEY) {
+    logger.warn('API_KEY não configurada. Bloqueando acesso.');
+    return res.status(500).json({ error: 'Server API key not configured' });
+  }
+  // Permite "Bearer {API_KEY}" ou valor direto
+  const provided = (apiKey || '').replace(/^Bearer\s+/i, '').trim();
+  if (provided !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
-};
+}
 
+// Aplique autenticação em todas as rotas (ajuste se quiser públicos /health)
 app.use(authenticate);
 
-// ============================================
-// FUNÇÃO: Obter ou criar sessão
-// ============================================
 function getOrCreateSession(sessionId) {
   if (!sessions.has(sessionId)) {
     sessions.set(sessionId, {
@@ -64,21 +54,14 @@ function getOrCreateSession(sessionId) {
       phone: null,
       retryCount: 0,
       lastQrTime: null,
-      authPath: `./baileys_auth_${sessionId}`,
+      authPath: path.resolve(`./baileys_auth_${sessionId}`),
     });
   }
   return sessions.get(sessionId);
 }
 
-// ============================================
-// FUNÇÃO: Enviar webhook para Supabase
-// ============================================
 async function sendWebhook(type, data, sessionId) {
-  if (!WEBHOOK_URL) {
-    logger.warn('WEBHOOK_URL não configurado');
-    return;
-  }
-
+  if (!WEBHOOK_URL) return;
   const payload = {
     type,
     sessionId,
@@ -89,101 +72,79 @@ async function sendWebhook(type, data, sessionId) {
   const maxRetries = 3;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      const response = await fetch(WEBHOOK_URL, {
+      const resp = await fetch(WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-
-      if (response.ok) {
-        logger.info(`✅ Webhook enviado: ${type} (${sessionId})`);
-        return;
-      }
-
-      logger.warn(`⚠️ Webhook falhou (tentativa ${attempt}/${maxRetries}): ${response.status}`);
-    } catch (error) {
-      logger.error(`❌ Erro no webhook (tentativa ${attempt}/${maxRetries}):`, error.message);
+      if (resp.ok) return;
+      logger.warn(`Webhook falhou (tentativa ${attempt}/${maxRetries}) status=${resp.status}`);
+    } catch (e) {
+      logger.warn(`Erro webhook (tentativa ${attempt}/${maxRetries}): ${e.message}`);
     }
-
     if (attempt < maxRetries) {
-      await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
     }
   }
 }
 
-// ============================================
-// FUNÇÃO: Limpar sessão completamente
-// ============================================
 async function cleanupSession(sessionId) {
-  const session = sessions.get(sessionId);
-  
-  if (session) {
-    logger.info(`🧹 Limpando sessão: ${sessionId}`);
-    
-    // Fecha socket se existir
-    if (session.socket) {
+  const s = sessions.get(sessionId);
+  if (s) {
+    logger.info({ sessionId }, 'Limpando sessão...');
+    if (s.socket) {
       try {
-        await session.socket.logout();
+        await s.socket.logout();
       } catch (e) {
-        logger.warn(`Erro ao fazer logout: ${e.message}`);
+        logger.warn({ sessionId, err: e.message }, 'Erro ao fazer logout');
       }
-      session.socket = null;
+      s.socket = null;
     }
-    
-    // Limpa dados da sessão
-    session.qr = null;
-    session.status = 'disconnected';
-    session.phone = null;
-    session.retryCount = 0;
-    session.lastQrTime = null;
+    s.qr = null;
+    s.status = 'disconnected';
+    s.phone = null;
+    s.retryCount = 0;
+    s.lastQrTime = null;
   }
-  
-  // Remove pasta de autenticação
-  const authPath = `./baileys_auth_${sessionId}`;
+  // Remove pasta de auth
+  const authPath = path.resolve(`./baileys_auth_${sessionId}`);
   if (fs.existsSync(authPath)) {
     try {
       fs.rmSync(authPath, { recursive: true, force: true });
-      logger.info(`📁 Pasta de auth removida: ${authPath}`);
+      logger.info({ sessionId, authPath }, 'Auth dir removido');
     } catch (e) {
-      logger.error(`❌ Erro ao remover pasta de auth: ${e.message}`);
+      logger.error({ sessionId, err: e.message }, 'Erro removendo auth dir');
     }
   }
 }
 
-// ============================================
-// FUNÇÃO: Criar conexão WhatsApp
-// ============================================
-async function createWhatsAppConnection(sessionId, options = {}) {
-  let session = getOrCreateSession(sessionId);
-  
-  logger.info(`🔌 Iniciando conexão para sessão: ${sessionId}`);
-  
-  // Limpa sessão antiga se existir
-  if (session.socket) {
-    logger.info('🔄 Fechando socket anterior...');
-    try {
-      await session.socket.logout();
-    } catch (e) {
-      logger.warn(`Erro ao fechar socket: ${e.message}`);
-    }
-    session.socket = null;
-  }
-  
-  // Remove pasta de auth se forçado
-  if (options.force || options.fresh) {
+async function createWhatsAppConnection(sessionId, opts = {}) {
+  let s = getOrCreateSession(sessionId);
+  logger.info({ sessionId, opts }, 'Criando conexão...');
+
+  // Se pediu fresh/force, limpa completamente
+  if (opts.force || opts.fresh) {
     await cleanupSession(sessionId);
-    session = getOrCreateSession(sessionId);
+    s = getOrCreateSession(sessionId);
+  } else if (s.socket) {
+    // Se já tem socket, tenta fechar
+    try {
+      await s.socket.logout();
+    } catch (e) {
+      logger.warn({ sessionId, err: e.message }, 'Erro ao fechar socket anterior');
+    }
+    s.socket = null;
   }
-  
-  // Garante que a pasta existe
-  if (!fs.existsSync(session.authPath)) {
-    fs.mkdirSync(session.authPath, { recursive: true });
+
+  // Garante pasta de auth
+  if (!fs.existsSync(s.authPath)) {
+    fs.mkdirSync(s.authPath, { recursive: true });
   }
-  
+
   try {
-    const { state, saveCreds } = await useMultiFileAuthState(session.authPath);
+    const { state, saveCreds } = await useMultiFileAuthState(s.authPath);
     const { version } = await fetchLatestBaileysVersion();
-    
+
     const socket = makeWASocket({
       version,
       logger: pino({ level: 'silent' }),
@@ -195,417 +156,295 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       browser: Browsers.ubuntu('Chrome'),
       getMessage: async () => null,
     });
-    
-    session.socket = socket;
-    session.status = 'connecting';
-    session.qr = null;
-    session.lastQrTime = Date.now();
-    
-    // ============================================
-    // EVENT: connection.update
-    // ============================================
+
+    s.socket = socket;
+    s.status = 'connecting';
+    s.qr = null;
+    s.lastQrTime = Date.now();
+
     socket.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-      
-      logger.info(`[${sessionId}] 🔄 Connection update:`, {
-        connection,
-        hasQr: !!qr,
-        reason: lastDisconnect?.error?.message,
-      });
-      
-      // QR Code recebido
+      const { connection, lastDisconnect, qr } = update || {};
       if (qr) {
         try {
-          session.qr = await qrcode.toDataURL(qr);
-          session.status = 'qr_ready';
-          session.lastQrTime = Date.now();
-          logger.info(`[${sessionId}] 📱 QR Code gerado`);
-          
-          await sendWebhook('qr', { qr: session.qr }, sessionId);
-        } catch (err) {
-          logger.error(`[${sessionId}] ❌ Erro ao gerar QR:`, err);
+          s.qr = await qrcode.toDataURL(qr);
+          s.status = 'qr_ready';
+          s.lastQrTime = Date.now();
+          await sendWebhook('qr', { qr: s.qr }, sessionId);
+          logger.info({ sessionId }, 'QR gerado');
+        } catch (e) {
+          logger.error({ sessionId, err: e.message }, 'Erro gerando QR');
         }
       }
-      
-      // Conectado
+
       if (connection === 'open') {
         const phone = socket.user?.id?.split(':')[0] || null;
-        session.status = 'connected';
-        session.phone = phone;
-        session.qr = null;
-        session.retryCount = 0;
-        
-        logger.info(`[${sessionId}] ✅ Conectado! Phone: ${phone}`);
-        
-        await sendWebhook('status-updated', { 
-          connected: true,
-          status: 'connected',
-          phone: { number: phone }
-        }, sessionId);
+        s.status = 'connected';
+        s.phone = phone;
+        s.qr = null;
+        s.retryCount = 0;
+        await sendWebhook('connected', { phone }, sessionId);
+        logger.info({ sessionId, phone }, 'Conectado');
       }
-      
-      // Desconectado
+
       if (connection === 'close') {
-        const shouldReconnect = (lastDisconnect?.error instanceof Boom) && 
-          lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        
-        logger.warn(`[${sessionId}] ⚠️ Desconectado. Reconectar: ${shouldReconnect}`);
-        
-        if (shouldReconnect && session.retryCount < 3) {
-          session.retryCount++;
-          logger.info(`[${sessionId}] 🔄 Tentando reconectar (${session.retryCount}/3)...`);
+        const code = (lastDisconnect?.error instanceof Boom)
+          ? lastDisconnect.error.output?.statusCode
+          : undefined;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+
+        logger.warn({ sessionId, code, shouldReconnect }, 'Desconectado');
+
+        if (shouldReconnect && s.retryCount < 3) {
+          s.retryCount++;
           setTimeout(() => createWhatsAppConnection(sessionId), 5000);
         } else {
-          session.status = 'disconnected';
-          session.socket = null;
-          session.qr = null;
-          session.phone = null;
-          
-          await sendWebhook('status-updated', {
-            connected: false,
-            status: 'disconnected'
-          }, sessionId);
+          s.status = 'disconnected';
+          s.socket = null;
+          s.qr = null;
+          s.phone = null;
+          await sendWebhook('disconnected', {}, sessionId);
         }
       }
     });
-    
-    // ============================================
-    // EVENT: creds.update
-    // ============================================
+
     socket.ev.on('creds.update', saveCreds);
-    
-    // ============================================
-    // EVENT: messages.upsert
-    // ============================================
+
     socket.ev.on('messages.upsert', async ({ messages }) => {
-      for (const message of messages) {
-        if (!message.message) continue;
-        
-        logger.info(`[${sessionId}] 💬 Nova mensagem:`, {
-          from: message.key.remoteJid,
-          id: message.key.id,
-        });
-        
-        await sendWebhook('received-message', {
-          instanceId: sessionId,
-          data: {
-            key: message.key,
-            message: message.message,
-            messageTimestamp: message.messageTimestamp,
-            pushName: message.pushName,
-          }
-        }, sessionId);
+      for (const m of messages || []) {
+        if (!m.message) continue;
+        await sendWebhook(
+          'message',
+          {
+            messageId: m.key.id,
+            from: m.key.remoteJid,
+            fromMe: m.key.fromMe,
+            message: m.message,
+            timestamp: m.messageTimestamp,
+          },
+          sessionId
+        );
       }
     });
-    
+
     return socket;
-  } catch (error) {
-    logger.error(`[${sessionId}] ❌ Erro ao criar conexão:`, error);
-    session.status = 'error';
-    session.socket = null;
-    throw error;
+  } catch (e) {
+    logger.error({ sessionId, err: e.message }, 'Erro criando conexão');
+    s.status = 'error';
+    s.socket = null;
+    throw e;
   }
 }
 
-// ============================================
-// ROTAS DA API
-// ============================================
+// ======== Rotas ========
 
-/**
- * POST /create-session
- * Cria ou reconecta uma sessão
- */
+// Cria/reconecta sessão (compatível com suas funções)
 app.post('/create-session', async (req, res) => {
   try {
-    const { session, sessionId, force, fresh } = req.body;
-    const finalSessionId = session || sessionId;
-    
-    if (!finalSessionId) {
-      return res.status(400).json({ error: 'session ou sessionId obrigatório' });
+    const { session, sessionId, force, fresh } = req.body || {};
+    const finalId = session || sessionId;
+    if (!finalId) return res.status(400).json({ error: 'sessionId obrigatório' });
+
+    await createWhatsAppConnection(finalId, { force, fresh });
+
+    const s = getOrCreateSession(finalId);
+    // espera curto por QR
+    const until = Date.now() + 10_000;
+    while (Date.now() < until && !s.qr && s.status === 'connecting') {
+      await new Promise((r) => setTimeout(r, 400));
     }
-    
-    logger.info(`📥 POST /create-session → ${finalSessionId}`, { force, fresh });
-    
-    await createWhatsAppConnection(finalSessionId, { force, fresh });
-    
-    const sessionData = getOrCreateSession(finalSessionId);
-    
-    // Aguarda QR code por até 10 segundos
-    const timeout = Date.now() + 10000;
-    while (Date.now() < timeout && !sessionData.qr && sessionData.status === 'connecting') {
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-    
-    res.json({
+
+    return res.json({
       success: true,
-      status: sessionData.status,
-      qr: sessionData.qr,
-      qrcode: sessionData.qr,
-      phone: sessionData.phone,
-      sessionId: finalSessionId,
+      status: s.status,
+      qr: s.qr,
+      qrcode: s.qr,
+      phone: s.phone,
+      sessionId: finalId,
     });
-  } catch (error) {
-    logger.error('❌ Erro em /create-session:', error);
-    res.status(500).json({ error: error.message });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 });
 
-/**
- * GET /sessions/:sessionId/qrcode
- * Retorna QR code de uma sessão específica
- */
+// QR por sessão
 app.get('/sessions/:sessionId/qrcode', (req, res) => {
-  const { sessionId } = req.params;
-  const session = sessions.get(sessionId);
-  
-  if (!session) {
-    return res.status(404).json({ error: 'Sessão não encontrada' });
-  }
-  
-  // QR code expira em 60 segundos
-  const qrAge = session.lastQrTime ? Date.now() - session.lastQrTime : null;
-  const qrExpired = qrAge && qrAge > 60000;
-  
-  res.json({
-    status: session.status,
-    qr: qrExpired ? null : session.qr,
-    qrcode: qrExpired ? null : session.qr,
-    phone: session.phone,
-    qrExpired,
-    qrAge,
+  const { sessionId } = req.params || {};
+  const s = sessions.get(sessionId);
+  if (!s) return res.status(404).json({ error: 'Sessão não encontrada' });
+  const age = s.lastQrTime ? Date.now() - s.lastQrTime : null;
+  const expired = age && age > 60_000;
+  return res.json({
+    status: s.status,
+    qr: expired ? null : s.qr,
+    qrcode: expired ? null : s.qr,
+    phone: s.phone,
+    qrExpired: !!expired,
+    qrAge: age ?? null,
   });
 });
 
-/**
- * GET /qrcode
- * Retorna QR code da primeira sessão disponível ou específica
- */
+// QR genérico (compatível com seu backend atual)
 app.get('/qrcode', (req, res) => {
   const sessionId = req.query.sessionId;
-  
   if (sessionId) {
-    const session = sessions.get(sessionId);
-    if (session) {
-      const qrAge = session.lastQrTime ? Date.now() - session.lastQrTime : null;
-      const qrExpired = qrAge && qrAge > 60000;
-      
+    const s = sessions.get(sessionId);
+    if (s) {
+      const age = s.lastQrTime ? Date.now() - s.lastQrTime : null;
+      const expired = age && age > 60_000;
       return res.json({
-        status: session.status,
-        qr: qrExpired ? null : session.qr,
-        qrcode: qrExpired ? null : session.qr,
-        phone: session.phone,
+        status: s.status,
+        qr: expired ? null : s.qr,
+        qrcode: expired ? null : s.qr,
+        phone: s.phone,
+        sessionId,
       });
     }
   }
-  
-  // Retorna primeira sessão com QR ativo
-  for (const [id, session] of sessions.entries()) {
-    const qrAge = session.lastQrTime ? Date.now() - session.lastQrTime : null;
-    const qrExpired = qrAge && qrAge > 60000;
-    
-    if (session.qr && !qrExpired) {
+  // devolve primeiro QR válido
+  for (const [id, s] of sessions.entries()) {
+    const age = s.lastQrTime ? Date.now() - s.lastQrTime : null;
+    const expired = age && age > 60_000;
+    if (s.qr && !expired) {
       return res.json({
-        status: session.status,
-        qr: session.qr,
-        qrcode: session.qr,
-        phone: session.phone,
+        status: s.status,
+        qr: s.qr,
+        qrcode: s.qr,
+        phone: s.phone,
         sessionId: id,
       });
     }
   }
-  
-  res.json({
-    status: 'disconnected',
-    qr: null,
-    qrcode: null,
-    phone: null,
-  });
+  return res.json({ status: 'disconnected', qr: null, qrcode: null, phone: null });
 });
 
-/**
- * GET /status
- * Retorna status de todas as sessões
- */
-app.get('/status', (req, res) => {
-  const sessionsStatus = {};
-  
-  for (const [id, session] of sessions.entries()) {
-    sessionsStatus[id] = {
-      status: session.status,
-      phone: session.phone,
-      hasQr: !!session.qr,
-      retryCount: session.retryCount,
+// Status
+app.get('/status', (_req, res) => {
+  const out = {};
+  for (const [id, s] of sessions.entries()) {
+    out[id] = {
+      status: s.status,
+      phone: s.phone,
+      hasQr: !!s.qr,
+      retryCount: s.retryCount,
     };
   }
-  
-  res.json({
-    sessions: sessionsStatus,
-    total: sessions.size,
-  });
+  return res.json({ sessions: out, total: sessions.size });
 });
 
-/**
- * DELETE /sessions/:sessionId
- * Remove sessão completamente
- */
-app.delete('/sessions/:sessionId', async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    
-    logger.info(`🗑️ DELETE /sessions/${sessionId}`);
-    
-    await cleanupSession(sessionId);
-    sessions.delete(sessionId);
-    
-    res.json({ success: true, message: 'Sessão removida' });
-  } catch (error) {
-    logger.error('❌ Erro em DELETE /sessions:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * POST /sessions/:sessionId/disconnect
- * Desconecta sessão sem remover dados
- */
-app.post('/sessions/:sessionId/disconnect', async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    const session = sessions.get(sessionId);
-    
-    if (!session) {
-      return res.status(404).json({ error: 'Sessão não encontrada' });
-    }
-    
-    logger.info(`🔌 POST /sessions/${sessionId}/disconnect`);
-    
-    if (session.socket) {
-      await session.socket.logout();
-      session.socket = null;
-    }
-    
-    session.status = 'disconnected';
-    session.qr = null;
-    session.phone = null;
-    
-    await sendWebhook('status-updated', {
-      connected: false,
-      status: 'disconnected'
-    }, sessionId);
-    
-    res.json({ success: true, message: 'Sessão desconectada' });
-  } catch (error) {
-    logger.error('❌ Erro em POST /disconnect:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * POST /disconnect
- * Alias para /sessions/:sessionId/disconnect (compatibilidade)
- */
-app.post('/disconnect', async (req, res) => {
-  try {
-    const { sessionId } = req.body;
-    if (!sessionId) {
-      return res.status(400).json({ error: 'sessionId obrigatório' });
-    }
-    
-    req.params.sessionId = sessionId;
-    return app._router.handle(req, res);
-  } catch (error) {
-    logger.error('❌ Erro em POST /disconnect:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * DELETE /session/:sessionId?
- * Alias para /sessions/:sessionId (compatibilidade)
- */
-app.delete('/session/:sessionId?', async (req, res) => {
-  const sessionId = req.params.sessionId || 'default';
-  req.params.sessionId = sessionId;
-  
+// Remoção (compatibilidade: DELETE /sessions/:id e DELETE /session/:id?)
+async function deleteSessionById(sessionId, res) {
   await cleanupSession(sessionId);
   sessions.delete(sessionId);
-  
-  res.json({ success: true, message: 'Sessão removida' });
-});
+  return res.json({ success: true, message: 'Sessão removida' });
+}
 
-/**
- * POST /send-message
- * Envia mensagem de texto
- */
-app.post('/send-message', async (req, res) => {
+app.delete('/sessions/:sessionId', async (req, res) => {
   try {
-    const { sessionId, to, phone, message, text } = req.body;
-    
-    if (!sessionId) {
-      return res.status(400).json({ error: 'sessionId obrigatório' });
-    }
-    
-    const recipient = to || phone;
-    const content = message || text;
-    
-    if (!recipient || !content) {
-      return res.status(400).json({ error: 'destinatário e mensagem são obrigatórios' });
-    }
-    
-    const session = sessions.get(sessionId);
-    
-    if (!session || !session.socket) {
-      return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
-    }
-    
-    const jid = recipient.includes('@') ? recipient : `${recipient}@s.whatsapp.net`;
-    
-    const result = await session.socket.sendMessage(jid, { text: content });
-    
-    logger.info(`✉️ Mensagem enviada: ${sessionId} → ${recipient}`);
-    
-    res.json({
-      success: true,
-      messageId: result.key.id,
-      to: jid,
-    });
-  } catch (error) {
-    logger.error('❌ Erro em /send-message:', error);
-    res.status(500).json({ error: error.message });
+    const { sessionId } = req.params || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId obrigatório' });
+    return await deleteSessionById(sessionId, res);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
   }
 });
 
-/**
- * GET /health
- * Health check
- */
-app.get('/health', (req, res) => {
+app.delete('/session/:sessionId?', async (req, res) => {
+  try {
+    const { sessionId } = req.params || {};
+    const bodyId = req.body?.sessionId;
+    const finalId = sessionId || bodyId;
+    if (!finalId) return res.status(400).json({ error: 'sessionId obrigatório' });
+    return await deleteSessionById(finalId, res);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Desconectar (compat: POST /sessions/:id/disconnect e POST /disconnect e POST /logout)
+async function disconnectSession(sessionId, res) {
+  const s = sessions.get(sessionId);
+  if (!s) return res.status(404).json({ error: 'Sessão não encontrada' });
+  if (s.socket) {
+    try {
+      await s.socket.logout();
+    } catch (e) {
+      // segue
+    }
+    s.socket = null;
+  }
+  s.status = 'disconnected';
+  s.qr = null;
+  s.phone = null;
+  await sendWebhook('disconnected', {}, sessionId);
+  return res.json({ success: true, message: 'Sessão desconectada' });
+}
+
+app.post('/sessions/:sessionId/disconnect', async (req, res) => {
+  try {
+    const { sessionId } = req.params || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId obrigatório' });
+    return await disconnectSession(sessionId, res);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/disconnect', async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId obrigatório' });
+    return await disconnectSession(sessionId, res);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/logout', async (req, res) => {
+  try {
+    const { sessionId } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId obrigatório' });
+    return await disconnectSession(sessionId, res);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Enviar mensagem
+app.post('/send-message', async (req, res) => {
+  try {
+    const { sessionId, to, message } = req.body || {};
+    if (!sessionId || !to || !message) {
+      return res.status(400).json({ error: 'sessionId, to e message são obrigatórios' });
+    }
+    const s = sessions.get(sessionId);
+    if (!s || !s.socket) {
+      return res.status(404).json({ error: 'Sessão não encontrada ou desconectada' });
+    }
+    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+    const result = await s.socket.sendMessage(jid, { text: message });
+    return res.json({ success: true, messageId: result?.key?.id, to: jid });
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+});
+
+// Health
+app.get('/health', (_req, res) => {
   res.json({ status: 'ok', uptime: process.uptime() });
 });
 
-// ============================================
-// SERVIDOR
-// ============================================
+// Inicia
 app.listen(PORT, () => {
-  logger.info(`🚀 Servidor Baileys Multi-usuário V2 rodando na porta ${PORT}`);
-  logger.info(`🔐 API Key configurada: ${API_KEY ? 'Sim' : 'Não'}`);
-  logger.info(`🔗 Webhook URL: ${WEBHOOK_URL || 'Não configurado'}`);
+  logger.info(`Servidor Baileys ouvindo na porta ${PORT}`);
 });
 
-// Graceful shutdown
+// Encerramento gracioso
 process.on('SIGINT', async () => {
-  logger.info('🛑 Encerrando servidor...');
-  
-  for (const [id, session] of sessions.entries()) {
-    if (session.socket) {
-      try {
-        await session.socket.logout();
-        logger.info(`Sessão ${id} desconectada`);
-      } catch (e) {
-        logger.warn(`Erro ao desconectar ${id}:`, e.message);
-      }
+  logger.info('Encerrando...');
+  for (const [id, s] of sessions.entries()) {
+    if (s.socket) {
+      try { await s.socket.logout(); } catch (_) {}
     }
   }
-  
   process.exit(0);
 });
