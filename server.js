@@ -3,6 +3,7 @@ const makeWASocket = require('@whiskeysockets/baileys').default;
 const { DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs').promises; // ← ADICIONADO
 
 const app = express();
 app.use(express.json());
@@ -194,6 +195,105 @@ app.post('/disconnect', authenticate, async (req, res) => {
   }
 });
 
+// ========== NOVOS ENDPOINTS DE LIMPEZA ==========
+
+// Endpoint para deletar uma sessão específica
+app.delete('/session/:sessionId', authenticate, async (req, res) => {
+  try {
+    console.log('🧹 Iniciando limpeza da sessão...');
+    
+    // 1. Desconectar o socket atual
+    if (sock) {
+      try {
+        await sock.logout();
+        console.log('✅ Socket desconectado');
+      } catch (error) {
+        console.log('⚠️ Erro ao desconectar socket (pode já estar desconectado):', error.message);
+      }
+      sock = null;
+    }
+
+    // 2. Resetar variáveis
+    connectionStatus = 'disconnected';
+    qrCodeData = null;
+
+    // 3. Remover a pasta auth_info
+    try {
+      await fs.rm('./auth_info', { recursive: true, force: true });
+      console.log('✅ Pasta auth_info removida');
+    } catch (error) {
+      console.log('⚠️ Erro ao remover auth_info (pode não existir):', error.message);
+    }
+
+    // 4. Notificar webhook
+    await notifyWebhook('session-deleted', {
+      status: 'disconnected',
+      connected: false
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Sessão deletada com sucesso' 
+    });
+  } catch (error) {
+    console.error('❌ Erro ao deletar sessão:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// Endpoint alternativo para deletar sessão (POST)
+app.post('/delete-session', authenticate, async (req, res) => {
+  try {
+    console.log('🧹 Iniciando limpeza da sessão (POST)...');
+    
+    // 1. Desconectar o socket atual
+    if (sock) {
+      try {
+        await sock.logout();
+        console.log('✅ Socket desconectado');
+      } catch (error) {
+        console.log('⚠️ Erro ao desconectar socket:', error.message);
+      }
+      sock = null;
+    }
+
+    // 2. Resetar variáveis
+    connectionStatus = 'disconnected';
+    qrCodeData = null;
+
+    // 3. Remover a pasta auth_info
+    try {
+      await fs.rm('./auth_info', { recursive: true, force: true });
+      console.log('✅ Pasta auth_info removida');
+    } catch (error) {
+      console.log('⚠️ Erro ao remover auth_info:', error.message);
+    }
+
+    // 4. Notificar webhook
+    await notifyWebhook('session-deleted', {
+      status: 'disconnected',
+      connected: false
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Sessão deletada com sucesso' 
+    });
+  } catch (error) {
+    console.error('❌ Erro ao deletar sessão:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// ========== FIM DOS NOVOS ENDPOINTS ==========
+
 app.listen(PORT, () => {
   console.log(`Baileys API rodando na porta ${PORT}`);
 });
+
