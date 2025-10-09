@@ -331,6 +331,7 @@ app.post('/create-session', async (req, res) => {
         success: true,
         qrcode: qrBase64,
         status: sessionData.connectionStatus,
+        id: sid,
         expiresIn: 60
       });
     }
@@ -344,6 +345,15 @@ app.post('/create-session', async (req, res) => {
     logger.error(`Erro em /create-session:`, error);
     res.status(500).json({ error: error.message });
   }
+});
+
+// 4. Obter QR Code (compatibilidade)
+app.get('/sessions/:id/qrcode', async (req, res, next) => {
+  console.log(`[Compatibilidade] Rota /sessions/${req.params.id}/qrcode acessada.`);
+  req.query.sessionId = req.params.id;
+  console.log('[Compatibilidade] Requisição modificada. Encaminhando...');
+  req.url = '/qrcode';
+  next();
 });
 
 // 3. Obter QR Code (polling)
@@ -386,12 +396,6 @@ app.get('/qrcode', async (req, res) => {
     logger.error(`Erro em /qrcode:`, error);
     res.status(500).json({ error: error.message });
   }
-});
-
-// 4. Obter QR Code (compatibilidade)
-app.get('/sessions/:id/qrcode', async (req, res) => {
-  req.query.sessionId = req.params.id;
-  return app._router.handle(req, res);
 });
 
 // 5. Desconectar sessão
