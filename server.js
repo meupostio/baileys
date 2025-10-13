@@ -291,6 +291,25 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   return sessionData;
 }
 
+// =================================================================
+// FUNÇÂO lógica de desconexão
+// =================================================================
+async function handleDisconnect(req, res) {
+  try {
+    const { sessionId } = req.body;
+    const sid = sessionId || 'default';
+
+    logger.info(`[${sid}] Iniciando desconexão...`);
+
+    await cleanupSession(sid);
+
+    res.json({ success: true, message: 'Desconectado com sucesso' });
+  } catch (error) {
+    logger.error(`Erro ao tentar desconectar a sessão ${sid || ''}:`, error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
 // ============================================
 // ENDPOINTS
 // ============================================
@@ -402,25 +421,12 @@ app.get('/qrcode', async (req, res) => {
 
 // 5. Desconectar sessão
 app.post('/disconnect', async (req, res) => {
-  try {
-    const { sessionId } = req.body;
-    const sid = sessionId || 'default';
-
-    logger.info(`[${sid}] POST /disconnect`);
-
-    await cleanupSession(sid);
-
-    res.json({ success: true, message: 'Desconectado com sucesso' });
-  } catch (error) {
-    logger.error(`Erro em /disconnect:`, error);
-    res.status(500).json({ error: error.message });
-  }
+  return handleDisconnect(req, res);
 });
 
 // 6. Logout (alias de disconnect)
 app.post('/logout', async (req, res) => {
-  req.body.sessionId = req.body.sessionId || 'default';
-  return app.post('/disconnect')(req, res);
+  return handleDisconnect(req, res);
 });
 
 // 7. Deletar sessão
