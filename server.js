@@ -209,16 +209,20 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       sessionData.qrCodeData = null;
       sessionData.qrExpiry = null;
       sessionData.reconnectAttempts = 0;
-      
+
       logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
-      
-      await sendWebhook({
-        event: 'status-updated',
+
+      const payload = {
+        event: 'connected',
         sessionId,
-        status: 'connected',
-        connected: true,
-        phone: { number: sessionData.phoneNumber }
-      });
+        phone: sessionData.phoneNumber,
+        data: {
+          connected: true,
+          phone: sessionData.phoneNumber 
+        }
+      };
+      // 4. Envie o payload correto para sua função
+      await sendWebhook(payload);
     }
 
     // Conexão fechada
