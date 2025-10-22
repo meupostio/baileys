@@ -37,6 +37,8 @@ const logger = P({
   }
 });
 
+let currentUserId = null;
+
 // ============================================
 // MIDDLEWARE DE AUTENTICAÇÃO
 // ============================================
@@ -212,9 +214,30 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
 
+      if (sessionId.startsWith('temp-')) {
+        try {
+          const response = await fetch(`${process.env.SUPABASE_URL}/rest/v1/baileys_temp_sessions?temp_session_id=eq.${sessionId}&select=user_id`, {
+            headers: {
+              'apikey': process.env.SUPABASE_ANON_KEY,
+              'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY}`
+            }
+          });
+          
+          const data = await response.json();
+          if (data && data.length > 0) {
+            currentUserId = data[0].user_id; // 🎯 Armazenar o userId real
+            logger.info(`[${sessionId}] ✅ Mapeado para userId: ${currentUserId}`);
+          }
+        } catch (error) {
+          logger.error(`[${sessionId}] ❌ Erro ao buscar userId:`, error);
+        }
+      } else {
+        currentUserId = sessionId;
+      }
+
       const payload = {
         event: 'connected',
-        sessionId,
+        sessionId: currentUserId || sessionId,
         phone: sessionData.phoneNumber,
         data: {
           connected: true,
@@ -239,7 +262,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       
       await sendWebhook({
         event: 'status-updated',
-        sessionId,
+        sessionId: currentUserId || sessionId,
         status: 'disconnected',
         connected: false
       });
@@ -276,12 +299,12 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         content = msg.message.extendedTextMessage.text;
       }
 
-      logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
+      logger.info(`[${currentUserId || sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
 
       await sendWebhook({
         event: 'received-message',
-        sessionId,
-        instanceId: sessionId,
+        sessionId: currentUserId || sessionId,
+        instanceId: currentUserId || sessionId,
         data: {
           key: msg.key,
           message: msg.message,
