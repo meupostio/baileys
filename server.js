@@ -216,12 +216,15 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       if (sessionId.startsWith('temp-')) {
         try {
-          const response = await fetch(`${process.env.SUPABASE_URL}/rest/v1/baileys_temp_sessions?temp_session_id=eq.${sessionId}&select=user_id`, {
-            headers: {
-              'apikey': process.env.SUPABASE_ANON_KEY,
-              'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY}`
+          const response = await fetch(
+            `${process.env.SUPABASE_URL}/rest/v1/whatsapp_instances?baileys_temp_session=eq.${sessionId}&select=user_id`,
+            {
+              headers: {
+                'apikey': process.env.SUPABASE_ANON_KEY,
+                'Authorization': `Bearer ${process.env.SUPABASE_ANON_KEY}`
+              }
             }
-          });
+          );
           
           const data = await response.json();
           if (data && data.length > 0) {
