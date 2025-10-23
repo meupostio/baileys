@@ -247,7 +247,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
       };
       // 4. Envie o payload correto para sua função
-      await sendWebhook(payload);
+      // await sendWebhook(payload);
     }
 
     // Conexão fechada
