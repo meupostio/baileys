@@ -227,6 +227,8 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           if (data && data.length > 0) {
             currentUserId = data[0].user_id; // 🎯 Armazenar o userId real
             logger.info(`[${sessionId}] ✅ Mapeado para userId: ${currentUserId}`);
+          } else {
+            logger.info(`[${sessionId}] ❌ Nenhum userId encontrado para a seção: ${sessionId}.`);
           }
         } catch (error) {
           logger.error(`[${sessionId}] ❌ Erro ao buscar userId:`, error);
