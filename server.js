@@ -498,6 +498,8 @@ app.post('/send-message', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
 
+    logger.info(`[${sid}] 💬 Enviando mensagem para ${phone}`);
+
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
     
     await sessionData.sock.sendMessage(jid, { text: message });
