@@ -37,8 +37,6 @@ const logger = P({
   }
 });
 
-let currentUserId = null;
-
 // ============================================
 // MIDDLEWARE DE AUTENTICAÇÃO
 // ============================================
@@ -95,6 +93,7 @@ async function getOrCreateSession(sessionId) {
   }
 
   const sessionData = {
+    currentUserId: null,
     sock: null,
     qrCodeData: null,
     qrExpiry: null,
@@ -225,8 +224,8 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           
           const data = await response.json();
           if (data && data.length > 0) {
-            currentUserId = data[0].user_id; // 🎯 Armazenar o userId real
-            logger.info(`[${sessionId}] ✅ Mapeado para userId: ${currentUserId}`);
+            sessionData.currentUserId = data[0].user_id; // 🎯 Armazenar o userId real
+            logger.info(`[${sessionId}] ✅ Mapeado para userId: ${sessionData.currentUserId}`);
           } else {
             logger.info(`[${sessionId}] ❌ Nenhum userId encontrado para a seção: ${sessionId}.`);
           }
@@ -234,12 +233,12 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           logger.error(`[${sessionId}] ❌ Erro ao buscar userId:`, error);
         }
       } else {
-        currentUserId = sessionId;
+        sessionData.currentUserId = sessionId;
       }
 
       const payload = {
         event: 'connected',
-        sessionId: currentUserId || sessionId,
+        sessionId: sessionData.currentUserId || sessionId,
         phone: sessionData.phoneNumber,
         data: {
           connected: true,
@@ -264,7 +263,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       
       await sendWebhook({
         event: 'status-updated',
-        sessionId: currentUserId || sessionId,
+        sessionId: sessionData.currentUserId || sessionId,
         status: 'disconnected',
         connected: false
       });
@@ -301,12 +300,12 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         content = msg.message.extendedTextMessage.text;
       }
 
-      logger.info(`[${currentUserId || sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
+      logger.info(`[${sessionData.currentUserId || sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
 
       await sendWebhook({
         event: 'received-message',
-        sessionId: currentUserId || sessionId,
-        instanceId: currentUserId || sessionId,
+        sessionId: sessionData.currentUserId || sessionId,
+        instanceId: sessionData.currentUserId || sessionId,
         data: {
           key: msg.key,
           message: msg.message,
