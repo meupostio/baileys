@@ -57,6 +57,8 @@ app.use(authenticate);
 async function sendWebhook(payload, retries = 3) {
   if (!WEBHOOK_URL) return;
   
+  console.log("Payload: ", payload); 
+  
   for (let i = 0; i < retries; i++) {
     try {
       const response = await fetch(WEBHOOK_URL, {
