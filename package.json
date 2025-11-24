@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@hapi/boom": "^10.0.1",
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "7.0.0-rc.8",
     "baileys": "github:WhiskeySockets/Baileys",
     "express": "^4.21.2",
     "pino": "^9.6.0",
