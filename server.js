@@ -280,17 +280,21 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
 
-      await sendWebhook({
-        event: 'received-message',
-        sessionId,
-        instanceId: sessionId,
-        data: {
-          key: msg.key,
-          message: msg.message,
-          messageTimestamp: msg.messageTimestamp,
-          pushName: msg.pushName
-        }
-      });
+      if (content.length > 0) {
+        await sendWebhook({
+          event: 'received-message',
+          sessionId,
+          instanceId: sessionId,
+          data: {
+            key: msg.key,
+            message: msg.message,
+            messageTimestamp: msg.messageTimestamp,
+            pushName: msg.pushName
+          }
+        });
+      } else {        
+        logger.error(`Erro ao tentar enviar mensagem de ${remoteJid} ${sessionId || ''}: mensagem vazia`);
+      }
     }
   });
 
