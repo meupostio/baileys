@@ -74,9 +74,9 @@ async function sendWebhook(payload, retries = 3) {
       
       const json = await response.json();
       
-      logger.warn(`[WEBHOOK] Falha (${response.status}), tentativa ${i + 1}/${retries}: ${JSON.stringify(json, null, 2)}`);
+      logger.warn(`[WEBHOOK] ${payload.event} Falha (${response.status}), tentativa ${i + 1}/${retries}: ${JSON.stringify(json, null, 2)}`);
     } catch (e) {
-      logger.error(`[WEBHOOK] Erro na tentativa ${i + 1}/${retries}: ${e.message}`, e.message);
+      logger.error(`[WEBHOOK] ${payload.event} Erro na tentativa ${i + 1}/${retries}: ${e.message}`, e.message);
       if (i < retries - 1) await new Promise(resolve => setTimeout(resolve, 2000));
     }
   }
