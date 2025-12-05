@@ -485,7 +485,7 @@ app.post('/send-message', async (req, res) => {
       const imageObject = { url: image }; 
 
       await sessionData.sock.sendMessage(jid, { 
-        image: imageObject, 
+        image: { url: image },
         caption: message
       });
       
