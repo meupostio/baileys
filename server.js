@@ -483,8 +483,8 @@ app.post('/send-message', async (req, res) => {
 
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
     
-    if (image.url) {
-      console.log(`Tentando enviar imagem para ${jid}. URL: ${image}`);
+    if (image) {
+      console.log(`Tentando enviar imagem para ${jid}. URL: ${image.url}`);
 
       if (!image.url.startsWith('http')) {
          throw new Error('O campo "image" deve ser uma URL válida (começando com http/https)');
