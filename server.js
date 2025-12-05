@@ -467,7 +467,7 @@ app.delete('/session/:sessionId?', async (req, res) => {
 // 8. Enviar mensagem
 app.post('/send-message', async (req, res) => {
   try {
-    const { sessionId, phone, message } = req.body;
+    const { sessionId, phone, message, image } = req.body;
     const sid = sessionId || 'default';
 
     if (!phone || !message) {
@@ -481,10 +481,21 @@ app.post('/send-message', async (req, res) => {
 
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
     
-    await sessionData.sock.sendMessage(jid, { text: message });
+    if (image) {
+      await sessionData.sock.sendMessage(jid, { 
+        image: image, 
+        text: message
+      });
+      logger.info(`[${sid}] ✅ Mensagem com imagem enviada para ${phone}`);
+    } else {
+      await sessionData.sock.sendMessage(jid, { 
+        text: message
+      });
+      logger.info(`[${sid}] ✅ Mensagem enviada para ${phone}`);
+    }
     
-    logger.info(`[${sid}] ✅ Mensagem enviada para ${phone}`);
     res.json({ success: true, message: 'Mensagem enviada' });
+    
   } catch (error) {
     logger.error(`Erro em /send-message:`, error);
     res.status(500).json({ error: error.message });
