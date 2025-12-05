@@ -482,10 +482,13 @@ app.post('/send-message', async (req, res) => {
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
     
     if (image) {
+      const imageObject = { url: image }; 
+
       await sessionData.sock.sendMessage(jid, { 
-        image: image, 
-        text: message
+        image: imageObject, 
+        caption: message
       });
+      
       logger.info(`[${sid}] ✅ Mensagem com imagem enviada para ${phone}`);
     } else {
       await sessionData.sock.sendMessage(jid, { 
@@ -493,7 +496,7 @@ app.post('/send-message', async (req, res) => {
       });
       logger.info(`[${sid}] ✅ Mensagem enviada para ${phone}`);
     }
-    
+
     res.json({ success: true, message: 'Mensagem enviada' });
     
   } catch (error) {
