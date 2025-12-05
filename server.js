@@ -467,6 +467,8 @@ app.delete('/session/:sessionId?', async (req, res) => {
 // 8. Enviar mensagem
 app.post('/send-message', async (req, res) => {
   try {
+    console.log('Recebido body:', JSON.stringify(req.body));
+
     const { sessionId, phone, message, image } = req.body;
     const sid = sessionId || 'default';
 
@@ -482,15 +484,21 @@ app.post('/send-message', async (req, res) => {
     const jid = phone.includes('@') ? phone : `${phone}@s.whatsapp.net`;
     
     if (image) {
-      const imageObject = { url: image }; 
+      console.log(`Tentando enviar imagem para ${jid}. URL: ${image}`);
+
+      if (!image.startsWith('http')) {
+         throw new Error('O campo "image" deve ser uma URL válida (começando com http/https)');
+      }
 
       await sessionData.sock.sendMessage(jid, { 
         image: { url: image },
-        caption: message
+        caption: message || ''
       });
       
       logger.info(`[${sid}] ✅ Mensagem com imagem enviada para ${phone}`);
     } else {
+      if (!message) return res.status(400).json({ error: 'Message é obrigatória se não houver imagem' });
+      
       await sessionData.sock.sendMessage(jid, { 
         text: message
       });
