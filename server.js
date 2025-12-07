@@ -4,7 +4,7 @@
 // CommonJS para Render.com
 // ============================================
 
-const { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { makeWASocket, DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage } = require('@whiskeysockets/baileys');
 const express = require('express');
 const P = require('pino');
 const fs = require('fs');
@@ -147,6 +147,35 @@ async function cleanupSession(sessionId) {
   logger.info(`[${sessionId}] Cleanup concluído`);
 }
 
+async function handleAudioMessage(msg, sessionId) {
+  try {
+    const buffer = await downloadMediaMessage(
+        msg,
+        'buffer',
+        { },
+        { 
+            logger: console, 
+            reuploadRequest: sock.updateMediaMessage 
+        }
+    );
+
+    const base64Audio = buffer.toString('base64');
+    
+    const mimetype = msg.message.audioMessage.mimetype; 
+    const isPtt = msg.message.audioMessage.ptt;
+
+    logger.info(`Session ${sessionId}: Áudio recebido e descriptografado!`);
+    logger.info(`Session ${sessionId}: MimeType:`, mimetype);
+    logger.info(`Session ${sessionId}: É Nota de Voz (PTT):`, isPtt);
+    logger.info(`Session ${sessionId}: Base64 (primeiros 50 chars):`, base64Audio.substring(0, 50) + '...');
+
+    return base64Audio;
+
+  } catch (error) {
+      logger.error(`Session ${sessionId}: Erro ao baixar áudio:`, error);
+  }
+}
+
 // ============================================
 // FUNÇÃO: Criar conexão WhatsApp
 // ============================================
@@ -272,26 +301,33 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       const messageType = Object.keys(msg.message)[0];
       let content = '';
 
+      let payload = {
+        event: 'received-message',
+        sessionId,
+        instanceId: sessionId,
+        data: {
+          key: msg.key,
+          messageTimestamp: msg.messageTimestamp,
+          pushName: msg.pushName
+        }
+      }
+
       if (messageType === 'conversation') {
         content = msg.message.conversation;
+        payload.data.message = msg.message;
       } else if (messageType === 'extendedTextMessage') {
         content = msg.message.extendedTextMessage.text;
+        payload.data.message = msg.message;
+      } else if (messageType === 'audioMessage') {
+        logger.info(`[${sessionId}] 🎵 Mensagem de áudio de ${remoteJid}`);
+        let base64Audio = handleAudioMessage(msg, sessionId);
+        payload.data.audio = base64Audio;
       }
 
       logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
 
-      if (content.length > 0) {
-        await sendWebhook({
-          event: 'received-message',
-          sessionId,
-          instanceId: sessionId,
-          data: {
-            key: msg.key,
-            message: msg.message,
-            messageTimestamp: msg.messageTimestamp,
-            pushName: msg.pushName
-          }
-        });
+      if (content.length > 0 || messageType === 'audioMessage') {
+        await sendWebhook(payload);
       } else {        
         logger.error(`Erro ao tentar enviar mensagem de ${remoteJid} ${sessionId || ''}: mensagem vazia`);
       }
