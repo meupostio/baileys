@@ -147,7 +147,7 @@ async function cleanupSession(sessionId) {
   logger.info(`[${sessionId}] Cleanup concluído`);
 }
 
-async function handleAudioMessage(msg, sessionId) {
+async function handleAudioMessage(msg, sock, sessionId) {
   try {
     const buffer = await downloadMediaMessage(
         msg,
@@ -173,6 +173,7 @@ async function handleAudioMessage(msg, sessionId) {
 
   } catch (error) {
       logger.error(`Session ${sessionId}: Erro ao baixar áudio:`, error);
+      return null;
   }
 }
 
@@ -320,7 +321,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         payload.data.message = msg.message;
       } else if (messageType === 'audioMessage') {
         logger.info(`[${sessionId}] 🎵 Mensagem de áudio de ${remoteJid}`);
-        let base64Audio =  await handleAudioMessage(msg, sessionId);
+        let base64Audio =  await handleAudioMessage(msg, sock, sessionId);
         payload.data.audio = base64Audio;
       }
 
