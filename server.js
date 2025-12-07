@@ -320,7 +320,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         payload.data.message = msg.message;
       } else if (messageType === 'audioMessage') {
         logger.info(`[${sessionId}] 🎵 Mensagem de áudio de ${remoteJid}`);
-        let base64Audio = handleAudioMessage(msg, sessionId);
+        let base64Audio =  await handleAudioMessage(msg, sessionId);
         payload.data.audio = base64Audio;
       }
 
