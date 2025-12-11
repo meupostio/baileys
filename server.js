@@ -509,8 +509,8 @@ app.post('/send-message', async (req, res) => {
     const { sessionId, phone, message, image } = req.body;
     const sid = sessionId || 'default';
 
-    if (!phone || !message) {
-      return res.status(400).json({ error: 'phone e message são obrigatórios' });
+    if (!phone || (!message || !image)) {
+      return res.status(400).json({ error: 'phone e message ou img são obrigatórios' });
     }
 
     const sessionData = sessions.get(sid);
