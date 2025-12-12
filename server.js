@@ -509,8 +509,16 @@ app.post('/send-message', async (req, res) => {
     const { sessionId, phone, message, image } = req.body;
     const sid = sessionId || 'default';
 
-    if (!phone || !message) {
-      return res.status(400).json({ error: 'phone e message são obrigatórios' });
+    // CORREÇÃO 1: Valida apenas o phone inicialmente
+    if (!phone) {
+      logger.error(`Phone é obrigatório`);
+      return res.status(400).json({ error: 'Phone é obrigatório' });
+    }
+
+    // CORREÇÃO 2: Valida se existe pelo menos um conteúdo (mensagem OU imagem)
+    if (!message && !image) {
+      logger.error(`É necessário enviar uma message ou uma image`);
+      return res.status(400).json({ error: 'É necessário enviar uma message ou uma image' });
     }
 
     const sessionData = sessions.get(sid);
