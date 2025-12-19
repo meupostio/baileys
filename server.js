@@ -296,7 +296,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   // ============================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message) continue;
 
       const remoteJid = msg.key.remoteJid;
       const messageType = Object.keys(msg.message)[0];
