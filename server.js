@@ -578,6 +578,16 @@ app.get('/status', (req, res) => {
   });
 });
 
+app.post('/sessions/:sessionId/profile-picture', async (req, res) => {
+  const { jid } = req.body;
+  const sock = sessions.get(req.params.sessionId);
+  if (sock) {
+    const url = await sock.profilePictureUrl(jid, 'image');
+    return res.json({ profilePictureUrl: url });
+  }
+  res.status(404).json({ error: 'Session not found' });
+});
+
 // ============================================
 // SERVIDOR
 // ============================================
