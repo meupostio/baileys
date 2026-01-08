@@ -588,7 +588,7 @@ app.post('/sessions/:sessionId/profile-picture', async (req, res) => {
     try {
         url = await sock.profilePictureUrl(jid, 'image');
     } catch (error) {
-        logger.error('Não foi possível obter a foto de perfil (privacidade ou erro):', error.message);
+        logger.error('Não foi possível obter a foto de perfil (privacidade ou erro):', error);
         url = null; 
     }
     return res.json({ profilePictureUrl: url });
