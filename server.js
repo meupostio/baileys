@@ -581,8 +581,16 @@ app.get('/status', (req, res) => {
 app.post('/sessions/:sessionId/profile-picture', async (req, res) => {
   const { jid } = req.body;
   const sock = sessions.get(req.params.sessionId);
+  const sessionId = req.params.sessionId || 'default';
+  logger.info(`[${sessionId}] GET /profile-picture`);
   if (sock) {
-    const url = await sock.sock.profilePictureUrl(jid, 'image');
+    let url;
+    try {
+        url = await sock.profilePictureUrl(jid, 'image');
+    } catch (error) {
+        logger.error('Não foi possível obter a foto de perfil (privacidade ou erro):', error.message);
+        url = null; 
+    }
     return res.json({ profilePictureUrl: url });
   }
   res.status(404).json({ error: 'Session not found' });
