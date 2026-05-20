@@ -32,29 +32,58 @@ const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const sessions = new Map();
 
 // ============================================
-// MAPA DE JIDs REAIS (corrige contato fantasma)
-// Quando o lead manda mensagem, salvamos o JID
-// exato que o WhatsApp usou. Quando vamos responder,
-// usamos esse mesmo JID — sem risco de duplicar contato.
+// MAPA DE JIDs REAIS (corrige contato fantasma + LID)
+//
+// O WhatsApp agora usa dois sistemas de ID:
+//   @s.whatsapp.net  → ID antigo (número de telefone)
+//   @lid             → ID novo interno do WhatsApp
+//
+// Quando o lead manda mensagem, chegam os dois:
+//   remoteJid:    '137199139950666@lid'       ← ID novo
+//   remoteJidAlt: '5511999999999@s.whatsapp.net' ← número real
+//
+// Salvamos o mapeamento: número limpo → jid correto para responder
 // ============================================
-const jidMap = new Map(); // phone_limpo -> jid_original
+const jidMap = new Map(); // phone_limpo -> jid_para_responder
 
-function saveJid(remoteJid) {
-  if (!remoteJid) return;
-  const phone = remoteJid.split('@')[0].split(':')[0];
-  jidMap.set(phone, remoteJid);
+function saveJidFromMessage(msgKey) {
+  if (!msgKey) return;
+
+  const remoteJid    = msgKey.remoteJid || '';
+  const remoteJidAlt = msgKey.remoteJidAlt || '';
+
+  // Ignora grupos
+  if (remoteJid.endsWith('@g.us')) return;
+
+  // Se veio com @lid, temos o JID novo e o número alternativo
+  if (remoteJid.endsWith('@lid') && remoteJidAlt) {
+    // Extrai o número limpo do Alt (número de telefone real)
+    const phone = remoteJidAlt.replace(/\D/g, '').split('@')[0].split(':')[0];
+    // Salva: número limpo → jid @lid (é o que o WhatsApp espera agora)
+    jidMap.set(phone, remoteJid);
+    logger.info(`[JID] Mapeado ${phone} → ${remoteJid} (LID)`);
+  } else if (remoteJid.endsWith('@s.whatsapp.net')) {
+    // Sistema antigo: salva o número → jid normal
+    const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
+    // Só salva se ainda não temos mapeamento LID para esse número
+    if (!jidMap.has(phone)) {
+      jidMap.set(phone, remoteJid);
+    }
+  }
 }
 
 function resolveJid(phone) {
   if (!phone) return null;
   const cleaned = phone.replace(/\D/g, '').split('@')[0].split(':')[0];
 
-  // Se já vimos esse lead receber mensagem, usa o JID original dele
+  // Se já vimos esse lead, usa o JID exato que o WhatsApp usa
   if (jidMap.has(cleaned)) {
-    return jidMap.get(cleaned);
+    const resolved = jidMap.get(cleaned);
+    logger.info(`[JID] Resolvido ${cleaned} → ${resolved}`);
+    return resolved;
   }
 
-  // Fallback: monta JID padrão (Brasil: adiciona nono dígito se faltou)
+  // Fallback: monta JID padrão com número de telefone
   let number = cleaned;
   if (number.startsWith('55') && number.length === 12) {
     const ddd = number.substring(2, 4);
@@ -127,55 +156,37 @@ async function sendWebhook(payload, retries = 3) {
 }
 
 // ============================================
-// FUNÇÃO: Obter ou criar sessão
+// SESSÕES
 // ============================================
 async function getOrCreateSession(sessionId) {
   if (!sessionId) sessionId = 'default';
-  
-  if (sessions.has(sessionId)) {
-    return sessions.get(sessionId);
-  }
+  if (sessions.has(sessionId)) return sessions.get(sessionId);
 
   const sessionData = {
-    sock: null,
-    qrCodeData: null,
-    qrExpiry: null,
-    connectionStatus: 'disconnected',
-    authState: null,
-    phoneNumber: null,
-    reconnectAttempts: 0
+    sock: null, qrCodeData: null, qrExpiry: null,
+    connectionStatus: 'disconnected', authState: null,
+    phoneNumber: null, reconnectAttempts: 0
   };
 
   const authDir = path.join(__dirname, 'auth_info', sessionId);
-  if (!fs.existsSync(authDir)) {
-    fs.mkdirSync(authDir, { recursive: true });
-  }
+  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
 
   sessions.set(sessionId, sessionData);
   logger.info(`[${sessionId}] Nova sessão criada`);
-  
   return sessionData;
 }
 
-// ============================================
-// FUNÇÃO: Cleanup seguro de sessão
-// ============================================
 async function cleanupSession(sessionId) {
   const sessionData = sessions.get(sessionId);
   if (!sessionData) return;
 
-  logger.info(`[${sessionId}] Iniciando cleanup de sessão...`);
+  logger.info(`[${sessionId}] Iniciando cleanup...`);
 
   if (sessionData.sock) {
     try {
-      if (sessionData.sock.user) {
-        await sessionData.sock.logout();
-        logger.info(`[${sessionId}] Logout realizado com sucesso`);
-      } else {
-        logger.warn(`[${sessionId}] Socket não autenticado, pulando logout`);
-      }
+      if (sessionData.sock.user) await sessionData.sock.logout();
     } catch (e) {
-      logger.warn(`[${sessionId}] Erro ao fazer logout: ${e.message}`);
+      logger.warn(`[${sessionId}] Erro logout: ${e.message}`);
     }
     sessionData.sock = null;
   }
@@ -185,26 +196,21 @@ async function cleanupSession(sessionId) {
   sessionData.connectionStatus = 'disconnected';
   sessionData.phoneNumber = null;
   sessionData.reconnectAttempts = 0;
-
   logger.info(`[${sessionId}] Cleanup concluído`);
 }
 
 // ============================================
-// FUNÇÃO: Criar conexão WhatsApp
+// CRIAR CONEXÃO WHATSAPP
 // ============================================
 async function createWhatsAppConnection(sessionId, options = {}) {
   const sessionData = await getOrCreateSession(sessionId);
   
   if (sessionData.sock) {
-    const isCurrentlyConnected = sessionData.sock.user && sessionData.connectionStatus === 'connected';
-    
-    if (isCurrentlyConnected) {
-      logger.info(`[${sessionId}] ✅ Socket já conectado e autenticado, mantendo conexão existente`);
-      logger.info(`[${sessionId}] 📱 Telefone: ${sessionData.phoneNumber}`);
+    const isConnected = sessionData.sock.user && sessionData.connectionStatus === 'connected';
+    if (isConnected) {
+      logger.info(`[${sessionId}] ✅ Socket já conectado: ${sessionData.phoneNumber}`);
       return sessionData;
     }
-    
-    logger.info(`[${sessionId}] Fechando socket anterior (status: ${sessionData.connectionStatus})...`);
     await cleanupSession(sessionId);
   }
 
@@ -215,8 +221,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   sessionData.authState = { state, saveCreds };
 
   const { version } = await fetchLatestBaileysVersion();
-  
-  logger.info(`[${sessionId}] Criando novo socket WhatsApp (versão ${version.join('.')})`);
+  logger.info(`[${sessionId}] Criando socket WhatsApp (versão ${version.join('.')})`);
   
   const sock = makeWASocket({
     version,
@@ -239,7 +244,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       sessionData.qrCodeData = qr;
       sessionData.qrExpiry = Date.now() + 60000;
       sessionData.connectionStatus = 'qr_ready';
-      logger.info(`[${sessionId}] 📱 QR Code disponível (expira em 60s)`);
+      logger.info(`[${sessionId}] 📱 QR Code disponível`);
     }
 
     if (connection === 'open') {
@@ -248,7 +253,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       sessionData.qrCodeData = null;
       sessionData.qrExpiry = null;
       sessionData.reconnectAttempts = 0;
-      
       logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
       
       await sendWebhook({
@@ -281,10 +285,10 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       if (shouldReconnect && sessionData.reconnectAttempts < 3) {
         sessionData.reconnectAttempts++;
         const delay = 5000 * sessionData.reconnectAttempts;
-        logger.info(`[${sessionId}] Tentativa de reconexão ${sessionData.reconnectAttempts}/3 em ${delay}ms`);
+        logger.info(`[${sessionId}] Reconectando ${sessionData.reconnectAttempts}/3 em ${delay}ms`);
         setTimeout(() => createWhatsAppConnection(sessionId, options), delay);
       } else if (sessionData.reconnectAttempts >= 3) {
-        logger.error(`[${sessionId}] Limite de reconexões atingido (3)`);
+        logger.error(`[${sessionId}] Limite de reconexões atingido`);
       }
     }
   });
@@ -293,10 +297,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
   // ============================================
   // EVENT: messages.upsert
-  // IDÊNTICO AO ORIGINAL — não alteramos o payload
-  // do webhook para não quebrar a plataforma.
-  // Apenas adicionamos o saveJid() para memorizar
-  // o JID real de cada contato.
   // ============================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
@@ -304,8 +304,14 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       const remoteJid = msg.key.remoteJid;
 
-      // ✅ Memoriza o JID original do contato
-      saveJid(remoteJid);
+      // ✅ IGNORA mensagens de grupo — evita erro "mensagem vazia"
+      if (remoteJid && remoteJid.endsWith('@g.us')) {
+        logger.info(`[${sessionId}] ⏭️ Mensagem de grupo ignorada: ${remoteJid}`);
+        continue;
+      }
+
+      // ✅ Salva o mapeamento JID (resolve LID + contato fantasma)
+      saveJidFromMessage(msg.key);
 
       const messageType = Object.keys(msg.message)[0];
       let content = '';
@@ -318,7 +324,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
 
-      // ✅ Payload IDÊNTICO ao original — não quebra a plataforma
+      // ✅ Payload idêntico ao original — não quebra a plataforma
       await sendWebhook({
         event: 'received-message',
         sessionId,
@@ -337,10 +343,9 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 }
 
 // ============================================
-// ENDPOINTS
+// ENDPOINTS BASE
 // ============================================
 
-// 1. Health Check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -350,70 +355,41 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 2. Criar sessão
 app.post('/create-session', async (req, res) => {
   try {
     const { sessionId, printQR } = req.body;
     const sid = sessionId || 'default';
-
-    logger.info(`[${sid}] POST /create-session`);
-
     const sessionData = await createWhatsAppConnection(sid, { printQR });
-    
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    await new Promise(r => setTimeout(r, 3000));
 
     if (sessionData.connectionStatus === 'connected') {
-      return res.json({
-        success: true,
-        status: 'connected',
-        phone: sessionData.phoneNumber
-      });
+      return res.json({ success: true, status: 'connected', phone: sessionData.phoneNumber });
     }
-
     if (sessionData.qrCodeData) {
       const qrBase64 = await QRCode.toDataURL(sessionData.qrCodeData);
-      return res.json({
-        success: true,
-        qrcode: qrBase64,
-        status: sessionData.connectionStatus,
-        expiresIn: 60
-      });
+      return res.json({ success: true, qrcode: qrBase64, status: sessionData.connectionStatus, expiresIn: 60 });
     }
-
-    return res.json({
-      success: true,
-      status: sessionData.connectionStatus,
-      message: 'Sessão criada, aguarde QR code'
-    });
+    return res.json({ success: true, status: sessionData.connectionStatus });
   } catch (error) {
-    logger.error(`Erro em /create-session:`, error);
+    logger.error(`Erro /create-session:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// 3. Obter QR Code (polling)
 app.get('/qrcode', async (req, res) => {
   try {
     const sessionId = req.query.sessionId || 'default';
     const sessionData = sessions.get(sessionId);
-
-    if (!sessionData) {
-      return res.json({ status: 'disconnected', message: 'Sessão não encontrada' });
-    }
+    if (!sessionData) return res.json({ status: 'disconnected' });
 
     if (sessionData.qrCodeData && sessionData.qrExpiry && Date.now() > sessionData.qrExpiry) {
-      logger.warn(`[${sessionId}] QR Code expirado, limpando...`);
       sessionData.qrCodeData = null;
       sessionData.qrExpiry = null;
     }
 
     if (sessionData.connectionStatus === 'connected') {
-      return res.json({
-        status: 'connected',
-        phone: sessionData.phoneNumber
-      });
+      return res.json({ status: 'connected', phone: sessionData.phoneNumber });
     }
-
     if (sessionData.qrCodeData) {
       const qrBase64 = await QRCode.toDataURL(sessionData.qrCodeData);
       return res.json({ 
@@ -422,63 +398,44 @@ app.get('/qrcode', async (req, res) => {
         expiresIn: Math.max(0, Math.floor((sessionData.qrExpiry - Date.now()) / 1000))
       });
     }
-
     return res.json({ status: sessionData.connectionStatus });
   } catch (error) {
-    logger.error(`Erro em /qrcode:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// 4. Obter QR Code (compatibilidade)
 app.get('/sessions/:id/qrcode', async (req, res) => {
   req.query.sessionId = req.params.id;
   return app._router.handle(req, res);
 });
 
-// 5. Desconectar sessão
 app.post('/disconnect', async (req, res) => {
   try {
-    const { sessionId } = req.body;
-    const sid = sessionId || 'default';
-    await cleanupSession(sid);
-    res.json({ success: true, message: 'Desconectado com sucesso' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    await cleanupSession(req.body.sessionId || 'default');
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// 6. Logout
 app.post('/logout', async (req, res) => {
   try {
-    const sid = req.body.sessionId || 'default';
-    await cleanupSession(sid);
-    res.json({ success: true, message: 'Logout realizado' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    await cleanupSession(req.body.sessionId || 'default');
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// 7. Deletar sessão
 app.delete('/session/:sessionId?', async (req, res) => {
   try {
     const sessionId = req.params.sessionId || 'default';
     await cleanupSession(sessionId);
-
     const authDir = path.join(__dirname, 'auth_info', sessionId);
-    if (fs.existsSync(authDir)) {
-      fs.rmSync(authDir, { recursive: true, force: true });
-    }
-
+    if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
     sessions.delete(sessionId);
-    res.json({ success: true, message: 'Sessão deletada' });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    res.json({ success: true });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 // ============================================
-// 8. ENVIAR MENSAGEM DE TEXTO
+// ENVIAR MENSAGEM DE TEXTO
 // ============================================
 app.post('/send-message', async (req, res) => {
   try {
@@ -494,21 +451,20 @@ app.post('/send-message', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
 
-    // ✅ Usa JID original se já vimos esse contato, ou monta padrão
+    // ✅ resolveJid usa o JID real do contato (LID ou @s.whatsapp.net)
     const jid = resolveJid(phone);
-    
     await sessionData.sock.sendMessage(jid, { text: message });
     
     logger.info(`[${sid}] ✅ Texto enviado para ${jid}`);
-    res.json({ success: true, message: 'Mensagem enviada', jid });
+    res.json({ success: true, jid });
   } catch (error) {
-    logger.error(`Erro em /send-message:`, error);
+    logger.error(`Erro /send-message:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================
-// 9. ENVIAR BOTÕES (interactiveMessage / nativeFlow)
+// ENVIAR BOTÕES (interactiveMessage / nativeFlow)
 // ============================================
 // Payload:
 // {
@@ -548,12 +504,10 @@ app.post('/send-buttons', async (req, res) => {
 
     const interactiveMsg = {
       interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-        body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
+        body:   proto.Message.InteractiveMessage.Body.fromObject({ text }),
         footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
         header: proto.Message.InteractiveMessage.Header.fromObject({
-          title: title || '',
-          subtitle: '',
-          hasMediaAttachment: false
+          title: title || '', subtitle: '', hasMediaAttachment: false
         }),
         nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
           buttons: nativeButtons
@@ -569,23 +523,22 @@ app.post('/send-buttons', async (req, res) => {
 
     await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
 
-    logger.info(`[${sid}] 🔘 Botões enviados para ${jid}`);
+    logger.info(`[${sid}] 🔘 Botões enviados para ${jid} (${buttons.length})`);
     res.json({ success: true, jid, type: 'buttons' });
   } catch (error) {
-    logger.error(`Erro em /send-buttons:`, error);
+    logger.error(`Erro /send-buttons:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================
-// 10. ENVIAR MENU / LISTA (modal com opções)
+// ENVIAR MENU / LISTA (modal com opções)
 // ============================================
 // Payload:
 // {
 //   "sessionId": "default",
 //   "phone": "5511999999999",
 //   "text": "ola",
-//   "title": "Menu",
 //   "buttonText": "Ver opções",
 //   "footer": "",
 //   "sections": [
@@ -593,8 +546,7 @@ app.post('/send-buttons', async (req, res) => {
 //       "title": "",
 //       "rows": [
 //         { "id": "opt_2", "title": "Opção 2", "description": "" },
-//         { "id": "opt_3", "title": "Opção 3", "description": "" },
-//         { "id": "opt_4", "title": "Opção 4", "description": "" }
+//         { "id": "opt_3", "title": "Opção 3", "description": "" }
 //       ]
 //     }
 //   ]
@@ -631,12 +583,10 @@ app.post('/send-list', async (req, res) => {
 
     const interactiveMsg = {
       interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-        body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
+        body:   proto.Message.InteractiveMessage.Body.fromObject({ text }),
         footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
         header: proto.Message.InteractiveMessage.Header.fromObject({
-          title: title || '',
-          subtitle: '',
-          hasMediaAttachment: false
+          title: title || '', subtitle: '', hasMediaAttachment: false
         }),
         nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
           buttons: [{
@@ -658,13 +608,13 @@ app.post('/send-list', async (req, res) => {
     logger.info(`[${sid}] 📋 Menu enviado para ${jid}`);
     res.json({ success: true, jid, type: 'list' });
   } catch (error) {
-    logger.error(`Erro em /send-list:`, error);
+    logger.error(`Erro /send-list:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================
-// 11. ENVIAR BOTÃO COM LINK (URL)
+// ENVIAR BOTÃO COM LINK (URL)
 // ============================================
 // Payload:
 // {
@@ -724,12 +674,10 @@ app.post('/send-link-button', async (req, res) => {
 
     const interactiveMsg = {
       interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-        body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
+        body:   proto.Message.InteractiveMessage.Body.fromObject({ text }),
         footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
         header: proto.Message.InteractiveMessage.Header.fromObject({
-          title: title || '',
-          subtitle: '',
-          hasMediaAttachment: false
+          title: title || '', subtitle: '', hasMediaAttachment: false
         }),
         nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
           buttons: nativeButtons
@@ -748,13 +696,13 @@ app.post('/send-link-button', async (req, res) => {
     logger.info(`[${sid}] 🔗 Link button enviado para ${jid}`);
     res.json({ success: true, jid, type: 'link_button' });
   } catch (error) {
-    logger.error(`Erro em /send-link-button:`, error);
+    logger.error(`Erro /send-link-button:`, error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================
-// 12. STATUS
+// STATUS
 // ============================================
 app.get('/status', (req, res) => {
   const allSessions = {};
@@ -766,7 +714,6 @@ app.get('/status', (req, res) => {
       reconnectAttempts: data.reconnectAttempts
     };
   });
-
   res.json({
     success: true,
     uptime: process.uptime(),
@@ -780,10 +727,9 @@ app.get('/status', (req, res) => {
 // SERVIDOR
 // ============================================
 app.listen(PORT, () => {
-  logger.info(`🚀 Servidor Baileys Multi-usuário rodando na porta ${PORT}`);
-  logger.info(`📱 Suporte para múltiplas sessões simultâneas`);
-  logger.info(`🔐 API Key configurada: ${API_KEY ? '✅' : '❌'}`);
-  logger.info(`🪝 Webhook URL: ${WEBHOOK_URL || 'Não configurado'}`);
+  logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
+  logger.info(`🔐 API Key: ${API_KEY ? '✅' : '❌'}`);
+  logger.info(`🪝 Webhook: ${WEBHOOK_URL || 'Não configurado'}`);
   logger.info(`📋 Endpoints:`);
   logger.info(`   POST /send-message     → Texto`);
   logger.info(`   POST /send-buttons     → Botões interativos`);
@@ -792,13 +738,11 @@ app.listen(PORT, () => {
 });
 
 process.on('SIGINT', async () => {
-  logger.info('⚠️ Desligando servidor...');
   for (const [sid] of sessions.entries()) await cleanupSession(sid);
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  logger.info('⚠️ SIGTERM recebido, desligando...');
   for (const [sid] of sessions.entries()) await cleanupSession(sid);
   process.exit(0);
 });
