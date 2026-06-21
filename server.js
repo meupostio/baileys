@@ -33,61 +33,46 @@ const sessions = new Map();
 
 // ============================================
 // MAPA DE JIDs REAIS (corrige contato fantasma + LID)
-//
-// O WhatsApp agora usa dois sistemas de ID:
-//   @s.whatsapp.net  → ID antigo (número de telefone)
-//   @lid             → ID novo interno do WhatsApp
-//
-// Quando o lead manda mensagem, chegam os dois:
-//   remoteJid:  '137199139950666@lid'              ← ID novo
-//   senderPn:   '5511999999999@s.whatsapp.net'     ← número real
-//
-// Salvamos o mapeamento: número limpo → jid correto para responder
 // ============================================
 const jidMap = new Map(); // phone_limpo -> jid_para_responder
 
-function saveJidFromMessage(msgKey) {
-  if (!msgKey) return;
+// Agora recebe remoteJid e senderPn separados (evita problema com proto)
+function saveJidFromMessage(remoteJid, senderPn) {
+  if (!remoteJid) return;
 
-  const remoteJid    = msgKey.remoteJid || '';
-  // senderPn é o campo real que o Baileys envia quando remoteJid é @lid
-  const remoteJidAlt = msgKey.remoteJidAlt || msgKey.senderPn || '';
-
-  // Ignora grupos
+  // Ignora grupos e broadcast
   if (remoteJid.endsWith('@g.us')) return;
+  if (remoteJid === 'status@broadcast') return;
 
-  if (remoteJid.endsWith('@lid') && remoteJidAlt) {
-    // Extrai o número limpo do senderPn
-    const phone = remoteJidAlt.replace(/\D/g, '').split('@')[0].split(':')[0];
-    // Usa o senderPn como JID de resposta (número real @s.whatsapp.net)
-    const jidToUse = remoteJidAlt.includes('@')
-      ? remoteJidAlt
+  if (remoteJid.endsWith('@lid') && senderPn) {
+    // senderPn = '558388862931@s.whatsapp.net'
+    const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
+    const jidToUse = senderPn.includes('@')
+      ? senderPn
       : `${phone}@s.whatsapp.net`;
     jidMap.set(phone, jidToUse);
     logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
   } else if (remoteJid.endsWith('@s.whatsapp.net')) {
-    // Sistema antigo: salva o número → jid normal
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    // Só salva se ainda não temos mapeamento para esse número
     if (!jidMap.has(phone)) {
       jidMap.set(phone, remoteJid);
     }
   }
+
+  logger.info(`[JID] jidMap atual: ${JSON.stringify([...jidMap.entries()])}`);
 }
 
 function resolveJid(phone) {
   if (!phone) return null;
   const cleaned = phone.replace(/\D/g, '').split('@')[0].split(':')[0];
 
-  // Se já vimos esse lead, usa o JID exato que o WhatsApp usa
   if (jidMap.has(cleaned)) {
     const resolved = jidMap.get(cleaned);
     logger.info(`[JID] Resolvido ${cleaned} → ${resolved}`);
     return resolved;
   }
 
-  // Fallback simples — NÃO adiciona o 9 (evita número errado)
-  // Se o contato ainda não enviou mensagem, usa o número como está
+  // Fallback simples — NÃO adiciona o 9
   if (phone.includes('@g.us')) return `${cleaned}@g.us`;
   return `${cleaned}@s.whatsapp.net`;
 }
@@ -313,8 +298,12 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         continue;
       }
 
-      // ✅ Salva o mapeamento JID (resolve LID + senderPn)
-      saveJidFromMessage(msg.key);
+      // ✅ Extrai senderPn direto do msg (não de msg.key — evita problema proto)
+      const senderPn = msg.key.senderPn || msg.key.participant || '';
+      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn}`);
+
+      // ✅ Salva o mapeamento JID passando os dois campos separados
+      saveJidFromMessage(remoteJid, senderPn);
 
       const messageType = Object.keys(msg.message)[0];
       let content = '';
@@ -449,6 +438,7 @@ app.post('/send-message', async (req, res) => {
     }
 
     const jid = resolveJid(phone);
+    logger.info(`[${sid}] 📤 Enviando para jid=${jid} (phone=${phone})`);
     await sessionData.sock.sendMessage(jid, { text: message });
     
     logger.info(`[${sid}] ✅ Texto enviado para ${jid}`);
