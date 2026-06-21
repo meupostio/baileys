@@ -39,8 +39,8 @@ const sessions = new Map();
 //   @lid             → ID novo interno do WhatsApp
 //
 // Quando o lead manda mensagem, chegam os dois:
-//   remoteJid:    '137199139950666@lid'       ← ID novo
-//   remoteJidAlt: '5511999999999@s.whatsapp.net' ← número real
+//   remoteJid:  '137199139950666@lid'              ← ID novo
+//   senderPn:   '5511999999999@s.whatsapp.net'     ← número real
 //
 // Salvamos o mapeamento: número limpo → jid correto para responder
 // ============================================
@@ -50,22 +50,25 @@ function saveJidFromMessage(msgKey) {
   if (!msgKey) return;
 
   const remoteJid    = msgKey.remoteJid || '';
-  const remoteJidAlt = msgKey.remoteJidAlt || '';
+  // senderPn é o campo real que o Baileys envia quando remoteJid é @lid
+  const remoteJidAlt = msgKey.remoteJidAlt || msgKey.senderPn || '';
 
   // Ignora grupos
   if (remoteJid.endsWith('@g.us')) return;
 
-  // Se veio com @lid, temos o JID novo e o número alternativo
   if (remoteJid.endsWith('@lid') && remoteJidAlt) {
-    // Extrai o número limpo do Alt (número de telefone real)
+    // Extrai o número limpo do senderPn
     const phone = remoteJidAlt.replace(/\D/g, '').split('@')[0].split(':')[0];
-    // Salva: número limpo → jid @lid (é o que o WhatsApp espera agora)
-    jidMap.set(phone, remoteJid);
-    logger.info(`[JID] Mapeado ${phone} → ${remoteJid} (LID)`);
+    // Usa o senderPn como JID de resposta (número real @s.whatsapp.net)
+    const jidToUse = remoteJidAlt.includes('@')
+      ? remoteJidAlt
+      : `${phone}@s.whatsapp.net`;
+    jidMap.set(phone, jidToUse);
+    logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
   } else if (remoteJid.endsWith('@s.whatsapp.net')) {
     // Sistema antigo: salva o número → jid normal
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    // Só salva se ainda não temos mapeamento LID para esse número
+    // Só salva se ainda não temos mapeamento para esse número
     if (!jidMap.has(phone)) {
       jidMap.set(phone, remoteJid);
     }
@@ -83,16 +86,10 @@ function resolveJid(phone) {
     return resolved;
   }
 
-  // Fallback: monta JID padrão com número de telefone
-  let number = cleaned;
-  if (number.startsWith('55') && number.length === 12) {
-    const ddd = number.substring(2, 4);
-    const rest = number.substring(4);
-    number = `55${ddd}9${rest}`;
-  }
-
-  if (phone.includes('@g.us')) return `${number}@g.us`;
-  return `${number}@s.whatsapp.net`;
+  // Fallback simples — NÃO adiciona o 9 (evita número errado)
+  // Se o contato ainda não enviou mensagem, usa o número como está
+  if (phone.includes('@g.us')) return `${cleaned}@g.us`;
+  return `${cleaned}@s.whatsapp.net`;
 }
 
 // ============================================
@@ -304,13 +301,19 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       const remoteJid = msg.key.remoteJid;
 
-      // ✅ IGNORA mensagens de grupo — evita erro "mensagem vazia"
+      // ✅ IGNORA mensagens de grupo
       if (remoteJid && remoteJid.endsWith('@g.us')) {
         logger.info(`[${sessionId}] ⏭️ Mensagem de grupo ignorada: ${remoteJid}`);
         continue;
       }
 
-      // ✅ Salva o mapeamento JID (resolve LID + contato fantasma)
+      // ✅ IGNORA status@broadcast
+      if (remoteJid === 'status@broadcast') {
+        logger.info(`[${sessionId}] ⏭️ Status broadcast ignorado`);
+        continue;
+      }
+
+      // ✅ Salva o mapeamento JID (resolve LID + senderPn)
       saveJidFromMessage(msg.key);
 
       const messageType = Object.keys(msg.message)[0];
@@ -319,12 +322,11 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       if (messageType === 'conversation') {
         content = msg.message.conversation;
       } else if (messageType === 'extendedTextMessage') {
-        content = msg.message.extendedTextMessage.text;
+        content = msg.message.extendedTextMessage?.text || '';
       }
 
       logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
 
-      // ✅ Payload idêntico ao original — não quebra a plataforma
       await sendWebhook({
         event: 'received-message',
         sessionId,
@@ -446,7 +448,6 @@ app.post('/send-message', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
 
-    // ✅ resolveJid usa o JID real do contato (LID ou @s.whatsapp.net)
     const jid = resolveJid(phone);
     await sessionData.sock.sendMessage(jid, { text: message });
     
@@ -459,7 +460,7 @@ app.post('/send-message', async (req, res) => {
 });
 
 // ============================================
-// ENVIAR BOTÕES (interactiveMessage / nativeFlow)
+// ENVIAR BOTÕES
 // ============================================
 app.post('/send-buttons', async (req, res) => {
   try {
@@ -515,7 +516,7 @@ app.post('/send-buttons', async (req, res) => {
 });
 
 // ============================================
-// ENVIAR MENU / LISTA (modal com opções)
+// ENVIAR MENU / LISTA
 // ============================================
 app.post('/send-list', async (req, res) => {
   try {
@@ -579,7 +580,7 @@ app.post('/send-list', async (req, res) => {
 });
 
 // ============================================
-// ENVIAR BOTÃO COM LINK (URL)
+// ENVIAR BOTÃO COM LINK
 // ============================================
 app.post('/send-link-button', async (req, res) => {
   try {
