@@ -31,6 +31,8 @@ function saveJidFromMessage(remoteJid, senderPn) {
   if (!remoteJid) return;
   if (remoteJid.endsWith('@g.us')) return;
   if (remoteJid === 'status@broadcast') return;
+  if (remoteJid.endsWith('@newsletter')) return;
+  if (remoteJid.endsWith('@broadcast')) return;
 
   if (remoteJid.endsWith('@lid') && senderPn) {
     const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
@@ -214,23 +216,35 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // ============================================
+  // EVENT: messages.upsert
+  // ============================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message) continue;
 
-      const remoteJid = msg.key.remoteJid;
-      if (remoteJid && remoteJid.endsWith('@g.us')) {
-        logger.info(`[${sessionId}] ⏭️ Mensagem de grupo ignorada: ${remoteJid}`);
+      const remoteJid = msg.key.remoteJid || '';
+
+      // ✅ IGNORA grupos, newsletters, broadcasts e status
+      if (
+        remoteJid.endsWith('@g.us') ||
+        remoteJid.endsWith('@newsletter') ||
+        remoteJid.endsWith('@broadcast') ||
+        remoteJid === 'status@broadcast'
+      ) {
+        logger.info(`[${sessionId}] ⏭️ Ignorado: ${remoteJid}`);
         continue;
       }
-      if (remoteJid === 'status@broadcast') {
-        logger.info(`[${sessionId}] ⏭️ Status broadcast ignorado`);
-        continue;
-      }
 
+      const isFromMe = msg.key.fromMe === true;
       const senderPn = msg.key.senderPn || msg.key.participant || '';
-      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn}`);
-      saveJidFromMessage(remoteJid, senderPn);
+
+      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
+
+      // Salva mapeamento JID apenas para mensagens recebidas
+      if (!isFromMe) {
+        saveJidFromMessage(remoteJid, senderPn);
+      }
 
       const msgType = Object.keys(msg.message)[0];
       let content = '';
@@ -241,7 +255,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         content = msg.message.extendedTextMessage?.text || '';
       }
 
-      logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
+      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} Mensagem ${isFromMe ? 'enviada' : 'recebida'} ${remoteJid}: ${content}`);
 
       // ============================================
       // DOWNLOAD DE ÁUDIO
@@ -275,7 +289,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           message: msg.message,
           messageTimestamp: msg.messageTimestamp,
           pushName: msg.pushName,
-          // Campos de mídia (null se não for áudio)
+          fromMe: isFromMe,
           audioBase64,
           audioMimetype,
         }
