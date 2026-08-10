@@ -12,7 +12,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "6.7.18",
     "express": "^4.21.2",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
