@@ -164,7 +164,11 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     auth: state,
     printQRInTerminal: options.printQR !== false,
     logger: P({ level: 'warn' }),
-    browser: ['Baileys Server', 'Chrome', '121.0.0'],
+    browser: ['WhatsApp Web', 'Chrome', '2.2412.54'],
+    generateHighQualityLinkPreview: false,
+    getMessage: async (key) => {
+      return { conversation: '' };
+    },
     syncFullHistory: false
   });
   sessionData.sock = sock;
