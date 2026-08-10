@@ -323,6 +323,18 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       }
 
       const isFromMe = msg.key.fromMe === true;
+
+      // ============================================
+      // TESTE: ignora mensagens enviadas pelo próprio
+      // aparelho (fromMe). Isso evita interferir no
+      // ciclo de criptografia Signal do WhatsApp e
+      // elimina o "Aguardando mensagem" no celular.
+      // ============================================
+      if (isFromMe) {
+        logger.info(`[${sessionId}] ⏭️ Ignorando fromMe (evita conflito de criptografia)`);
+        continue;
+      }
+
       const senderPn = msg.key.senderPn || msg.key.participant || '';
       logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
 
