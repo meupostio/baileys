@@ -325,13 +325,40 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       const isFromMe = msg.key.fromMe === true;
 
       // ============================================
-      // TESTE: ignora mensagens enviadas pelo próprio
-      // aparelho (fromMe). Isso evita interferir no
-      // ciclo de criptografia Signal do WhatsApp e
-      // elimina o "Aguardando mensagem" no celular.
+      // MENSAGENS fromMe (enviadas pelo celular)
+      // Processadas de forma NÃO-BLOQUEANTE via
+      // setImmediate para não interferir no ciclo de
+      // criptografia Signal — evita "Aguardando mensagem".
+      // Não baixa mídia para não consumir a sessão.
       // ============================================
       if (isFromMe) {
-        logger.info(`[${sessionId}] ⏭️ Ignorando fromMe (evita conflito de criptografia)`);
+        const fmType = Object.keys(msg.message)[0];
+        let fmContent = '';
+        if (fmType === 'conversation') {
+          fmContent = msg.message.conversation;
+        } else if (fmType === 'extendedTextMessage') {
+          fmContent = msg.message.extendedTextMessage?.text || '';
+        }
+
+        // Dispara webhook fora do event loop do Baileys
+        setImmediate(() => {
+          sendWebhook({
+            event: 'received-message',
+            sessionId,
+            instanceId: sessionId,
+            data: {
+              key: msg.key,
+              message: msg.message,
+              messageTimestamp: msg.messageTimestamp,
+              pushName: msg.pushName,
+              fromMe: true,
+              audioBase64: null,
+              audioMimetype: null,
+            }
+          }).catch(e => logger.warn(`[${sessionId}] Webhook fromMe falhou: ${e.message}`));
+        });
+
+        logger.info(`[${sessionId}] 📤 fromMe espelhado (async) ${remoteJid}: ${fmContent}`);
         continue;
       }
 
