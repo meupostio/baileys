@@ -15,8 +15,10 @@ const P = require('pino');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
+
 const app = express();
 app.use(express.json());
+
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
@@ -42,6 +44,9 @@ const logger = P({
   }
 });
 
+// ============================================
+// JID HELPERS
+// ============================================
 function saveJidFromMessage(remoteJid, senderPn) {
   if (!remoteJid) return;
   if (remoteJid.endsWith('@g.us')) return;
@@ -52,7 +57,6 @@ function saveJidFromMessage(remoteJid, senderPn) {
     const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
     const jidToUse = senderPn.includes('@') ? senderPn : `${phone}@s.whatsapp.net`;
     jidMap.set(phone, jidToUse);
-    // Mapeia também o lid
     const lid = remoteJid.split('@')[0];
     jidMap.set(lid, jidToUse);
     logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
@@ -74,6 +78,9 @@ function resolveJid(phone) {
   return `${cleaned}@s.whatsapp.net`;
 }
 
+// ============================================
+// AUTH
+// ============================================
 const authenticate = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   if (apiKey !== API_KEY) {
@@ -84,6 +91,9 @@ const authenticate = (req, res, next) => {
 };
 app.use(authenticate);
 
+// ============================================
+// WEBHOOK
+// ============================================
 async function sendWebhook(payload, retries = 3) {
   if (!WEBHOOK_URL) return;
   for (let i = 0; i < retries; i++) {
@@ -106,13 +116,21 @@ async function sendWebhook(payload, retries = 3) {
   logger.error(`[WEBHOOK] Falhou após ${retries} tentativas`);
 }
 
+// ============================================
+// SESSION MANAGEMENT
+// ============================================
 async function getOrCreateSession(sessionId) {
   if (!sessionId) sessionId = 'default';
   if (sessions.has(sessionId)) return sessions.get(sessionId);
   const sessionData = {
-    sock: null, qrCodeData: null, qrExpiry: null,
-    connectionStatus: 'disconnected', authState: null,
-    phoneNumber: null, reconnectAttempts: 0
+    sock: null,
+    qrCodeData: null,
+    qrExpiry: null,
+    connectionStatus: 'disconnected',
+    authState: null,
+    phoneNumber: null,
+    reconnectAttempts: 0,
+    keepAliveInterval: null,   // ← keep-alive
   };
   const authDir = path.join(__dirname, 'auth_info', sessionId);
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
@@ -125,6 +143,13 @@ async function cleanupSession(sessionId) {
   const sessionData = sessions.get(sessionId);
   if (!sessionData) return;
   logger.info(`[${sessionId}] Iniciando cleanup...`);
+
+  // Cancela keep-alive
+  if (sessionData.keepAliveInterval) {
+    clearInterval(sessionData.keepAliveInterval);
+    sessionData.keepAliveInterval = null;
+  }
+
   if (sessionData.sock) {
     try {
       if (sessionData.sock.user) await sessionData.sock.logout();
@@ -141,6 +166,9 @@ async function cleanupSession(sessionId) {
   logger.info(`[${sessionId}] Cleanup concluído`);
 }
 
+// ============================================
+// CRIAR CONEXÃO WHATSAPP
+// ============================================
 async function createWhatsAppConnection(sessionId, options = {}) {
   const sessionData = await getOrCreateSession(sessionId);
   
@@ -152,10 +180,12 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     }
     await cleanupSession(sessionId);
   }
+
   sessionData.reconnectAttempts = 0;
   const authDir = path.join(__dirname, 'auth_info', sessionId);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   sessionData.authState = { state, saveCreds };
+
   const { version } = await fetchLatestBaileysVersion();
   logger.info(`[${sessionId}] Criando socket WhatsApp (versão ${version.join('.')})`);
   
@@ -163,24 +193,32 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     version,
     auth: state,
     printQRInTerminal: options.printQR !== false,
-    logger: P({ level: 'warn' }),
+    logger: P({ level: 'silent' }),
+    // Identifica como WhatsApp Web oficial — evita invalidação de sessão
     browser: ['WhatsApp Web', 'Chrome', '2.2412.54'],
+    syncFullHistory: false,
     generateHighQualityLinkPreview: false,
+    // Necessário para re-cifrar mensagens sem fechar sessão
     getMessage: async (key) => {
       return { conversation: '' };
     },
-    syncFullHistory: false
   });
+
   sessionData.sock = sock;
 
+  // ============================================
+  // CONNECTION UPDATE
+  // ============================================
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
+
     if (qr) {
       sessionData.qrCodeData = qr;
       sessionData.qrExpiry = Date.now() + 60000;
       sessionData.connectionStatus = 'qr_ready';
       logger.info(`[${sessionId}] 📱 QR Code disponível`);
     }
+
     if (connection === 'open') {
       sessionData.connectionStatus = 'connected';
       sessionData.phoneNumber = sock.user?.id?.split(':')[0] || null;
@@ -188,24 +226,54 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       sessionData.qrExpiry = null;
       sessionData.reconnectAttempts = 0;
       logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
+
+      // ============================================
+      // KEEP-ALIVE — mantém sessão de criptografia
+      // ativa enviando presença a cada 3 minutos.
+      // Evita o "Aguardando mensagem" por inatividade.
+      // ============================================
+      if (sessionData.keepAliveInterval) {
+        clearInterval(sessionData.keepAliveInterval);
+      }
+      sessionData.keepAliveInterval = setInterval(async () => {
+        try {
+          if (sessionData.connectionStatus === 'connected' && sessionData.sock) {
+            await sock.sendPresenceUpdate('available');
+            logger.info(`[${sessionId}] 💓 Keep-alive OK`);
+          }
+        } catch (e) {
+          logger.warn(`[${sessionId}] 💔 Keep-alive falhou: ${e.message}`);
+        }
+      }, 3 * 60 * 1000); // a cada 3 minutos
+
       await sendWebhook({
         event: 'status-updated', sessionId,
         status: 'connected', connected: true,
         phone: { number: sessionData.phoneNumber }
       });
     }
+
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       logger.warn(`[${sessionId}] ❌ Conexão fechada (código: ${statusCode})`);
+
+      // Cancela keep-alive ao desconectar
+      if (sessionData.keepAliveInterval) {
+        clearInterval(sessionData.keepAliveInterval);
+        sessionData.keepAliveInterval = null;
+      }
+
       sessionData.connectionStatus = 'disconnected';
       sessionData.qrCodeData = null;
       sessionData.qrExpiry = null;
       sessionData.phoneNumber = null;
+
       await sendWebhook({
         event: 'status-updated', sessionId,
         status: 'disconnected', connected: false
       });
+
       if (shouldReconnect && sessionData.reconnectAttempts < 3) {
         sessionData.reconnectAttempts++;
         const delay = 5000 * sessionData.reconnectAttempts;
@@ -219,7 +287,9 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Popula jidMap via contacts.upsert
+  // ============================================
+  // CONTACTS UPSERT — popula jidMap com @lid
+  // ============================================
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const contact of contacts) {
       if (contact.id && contact.id.endsWith('@s.whatsapp.net')) {
@@ -234,10 +304,14 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     }
   });
 
+  // ============================================
+  // MESSAGES UPSERT
+  // ============================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
       const remoteJid = msg.key.remoteJid || '';
+
       if (
         remoteJid.endsWith('@g.us') ||
         remoteJid.endsWith('@newsletter') ||
@@ -247,12 +321,15 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         logger.info(`[${sessionId}] ⏭️ Ignorado: ${remoteJid}`);
         continue;
       }
+
       const isFromMe = msg.key.fromMe === true;
       const senderPn = msg.key.senderPn || msg.key.participant || '';
       logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
+
       if (!isFromMe) {
         saveJidFromMessage(remoteJid, senderPn);
       }
+
       const msgType = Object.keys(msg.message)[0];
       let content = '';
       if (msgType === 'conversation') {
