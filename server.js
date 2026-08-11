@@ -25,6 +25,37 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const sessions = new Map();
 const jidMap = new Map();
+const JIDMAP_FILE = path.join(__dirname, 'auth_info', 'jidmap.json');
+let persistDebounceTimer = null;
+
+function loadJidMapFromDisk() {
+  try {
+    if (fs.existsSync(JIDMAP_FILE)) {
+      const raw = fs.readFileSync(JIDMAP_FILE, 'utf-8');
+      const obj = JSON.parse(raw);
+      for (const [k, v] of Object.entries(obj)) {
+        jidMap.set(k, v);
+      }
+      console.log(`[JIDMAP] Carregado do disco: ${jidMap.size} entradas`);
+    }
+  } catch (e) {
+    console.error('[JIDMAP] Erro ao carregar do disco:', e.message);
+  }
+}
+
+function persistJidMap() {
+  clearTimeout(persistDebounceTimer);
+  persistDebounceTimer = setTimeout(() => {
+    try {
+      const dir = path.dirname(JIDMAP_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      const obj = Object.fromEntries(jidMap.entries());
+      fs.writeFileSync(JIDMAP_FILE, JSON.stringify(obj), 'utf-8');
+    } catch (e) {
+      console.error('[JIDMAP] Erro ao persistir:', e.message);
+    }
+  }, 2000); // debounce de 2s
+}
 
 // ============================================
 // CAPTURA ERROS — evita crash do processo
@@ -60,9 +91,13 @@ function saveJidFromMessage(remoteJid, senderPn) {
     const lid = remoteJid.split('@')[0];
     jidMap.set(lid, jidToUse);
     logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
+    persistJidMap();
   } else if (remoteJid.endsWith('@s.whatsapp.net')) {
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    if (!jidMap.has(phone)) jidMap.set(phone, remoteJid);
+    if (!jidMap.has(phone)) {
+      jidMap.set(phone, remoteJid);
+      persistJidMap();
+    }
   }
 }
 
@@ -74,31 +109,44 @@ async function resolveLidToPhone(sock, lidJid) {
   if (!lidJid || !lidJid.endsWith('@lid')) return null;
   const lid = lidJid.split('@')[0];
 
-  // 1. Já está no cache?
+  // 1. Cache local
   if (jidMap.has(lid)) {
     const cached = jidMap.get(lid);
     logger.info(`[LID] Cache hit: ${lid} → ${cached}`);
     return cached;
   }
 
-  // 2. Tenta via store de contatos do socket
+  // 2. signalRepository.lidMapping — fonte correta no Baileys 6.7.x
   try {
-    if (sock.authState?.creds?.me?.lid) {
-      // Não é o próprio usuário
-    }
-    // Busca nos contatos conhecidos do socket
-    const contacts = sock.authState?.creds?.contacts || {};
-    for (const [id, contact] of Object.entries(contacts)) {
-      if (contact?.lid && contact.lid.includes(lid)) {
-        const phone = id.split('@')[0];
+    const lidMapping = sock.signalRepository?.lidMapping;
+    if (lidMapping?.getPNForLID) {
+      const pn = await lidMapping.getPNForLID(`${lid}@lid`);
+      if (pn) {
+        const phone = String(pn).split('@')[0].replace(/\D/g, '');
         const jid = `${phone}@s.whatsapp.net`;
         jidMap.set(lid, jid);
-        logger.info(`[LID] Resolvido via contacts: ${lid} → ${jid}`);
+        jidMap.set(phone, jid);
+        persistJidMap();
+        logger.info(`[LID] signalRepository: ${lid} → ${jid}`);
+        return jid;
+      }
+    }
+    // Tenta em lote também, algumas versões só implementam o plural
+    if (lidMapping?.getPNForLIDs) {
+      const results = await lidMapping.getPNForLIDs([`${lid}@lid`]);
+      const pn = results?.[`${lid}@lid`] || results?.[0];
+      if (pn) {
+        const phone = String(pn).split('@')[0].replace(/\D/g, '');
+        const jid = `${phone}@s.whatsapp.net`;
+        jidMap.set(lid, jid);
+        jidMap.set(phone, jid);
+        persistJidMap();
+        logger.info(`[LID] signalRepository (batch): ${lid} → ${jid}`);
         return jid;
       }
     }
   } catch (e) {
-    logger.warn(`[LID] Erro ao buscar em contacts: ${e.message}`);
+    logger.warn(`[LID] signalRepository falhou: ${e.message}`);
   }
 
   logger.warn(`[LID] Não foi possível resolver ${lid}`);
@@ -341,6 +389,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       jidMap.set(phone, jid);
       if (already !== jid) {
         logger.info(`[${sessionId}] [MAP:${origin}] lid=${lid} → ${jid}`);
+        persistJidMap();
       }
     } catch (e) {
       logger.warn(`[${sessionId}] registerLidPhonePair erro: ${e.message}`);
@@ -406,6 +455,17 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       const isFromMe = msg.key.fromMe === true;
       const senderPn = msg.key.senderPn || msg.key.participant || '';
+
+      // Captura fontes extras de mapeamento lid<->pn que vêm na própria mensagem
+      if (msg.key.senderLid && msg.key.senderPn) {
+        registerLidPhonePair(msg.key.senderLid, msg.key.senderPn, 'msg.senderLid');
+      }
+      if (msg.key.participantLid && msg.key.participantPn) {
+        registerLidPhonePair(msg.key.participantLid, msg.key.participantPn, 'msg.participantLid');
+      }
+      if (remoteJid.endsWith('@lid') && msg.key.participantPn) {
+        registerLidPhonePair(remoteJid, msg.key.participantPn, 'msg.remoteJid+participantPn');
+      }
 
       // ============================================
       // RESOLUÇÃO DE @lid → número real
@@ -702,10 +762,11 @@ app.post('/send-link-button', async (req, res) => {
 // RESOLVE LID → número real
 // GET /resolve-lid?sessionId=...&lid=...
 // ============================================
-app.get('/resolve-lid', async (req, res) => {
+async function handleResolveLid(req, res) {
   try {
-    const sessionId = req.query.sessionId || 'default';
-    const lidRaw = req.query.lid;
+    const params = req.method === 'POST' ? req.body : req.query;
+    const sessionId = params.sessionId || 'default';
+    const lidRaw = params.lid;
     if (!lidRaw) return res.status(400).json({ error: 'lid é obrigatório' });
 
     const sessionData = sessions.get(sessionId);
@@ -768,7 +829,10 @@ app.get('/resolve-lid', async (req, res) => {
     logger.error(`Erro /resolve-lid: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
-});
+}
+
+app.get('/resolve-lid', handleResolveLid);
+app.post('/resolve-lid', handleResolveLid);
 
 // ============================================
 // ON WHATSAPP — verifica se número existe
@@ -776,16 +840,34 @@ app.get('/resolve-lid', async (req, res) => {
 // ============================================
 app.post('/on-whatsapp', async (req, res) => {
   try {
-    const { sessionId, jid, phone } = req.body;
+    const { sessionId, jid, phone, lid } = req.body;
     const sid = sessionId || 'default';
-    const target = jid || phone;
-    if (!target) return res.status(400).json({ error: 'jid ou phone é obrigatório' });
+    let target = jid || phone;
 
     const sessionData = sessions.get(sid);
     if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
     const sock = sessionData.sock;
+
+    // Se veio um @lid explícito, ou o "target" parece um lid (não um telefone
+    // válido — muito longo ou sem prefixo de país plausível), tenta resolver
+    // via cache/signalRepository ANTES de consultar onWhatsApp com dígitos errados.
+    const lidCandidate = lid || (target && target.includes('@lid') ? target : null);
+    if (lidCandidate) {
+      const resolved = await resolveLidToPhone(sock, lidCandidate.includes('@lid') ? lidCandidate : `${lidCandidate.replace(/\D/g, '')}@lid`);
+      if (resolved) {
+        const p = resolved.split('@')[0];
+        return res.json({ exists: true, jid: resolved, phone: p, source: 'lid_resolved' });
+      }
+      // Não conseguiu resolver o lid — não adianta consultar onWhatsApp com o lid como número
+      if (!phone) {
+        return res.json({ exists: false, jid: null, phone: null, source: 'lid_unresolved' });
+      }
+      target = phone; // cai para tentar com o telefone, se veio um
+    }
+
+    if (!target) return res.status(400).json({ error: 'jid, phone ou lid é obrigatório' });
 
     const cleaned = String(target).replace(/\D/g, '');
     logger.info(`[${sid}] [ON-WHATSAPP] Verificando ${cleaned}`);
@@ -824,6 +906,8 @@ app.get('/status', (req, res) => {
   });
   res.json({ success: true, uptime: process.uptime(), totalSessions: sessions.size, knownContacts: jidMap.size, sessions: allSessions });
 });
+
+loadJidMapFromDisk();
 
 app.listen(PORT, () => {
   logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
