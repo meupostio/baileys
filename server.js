@@ -66,6 +66,45 @@ function saveJidFromMessage(remoteJid, senderPn) {
   }
 }
 
+// ============================================
+// Resolve @lid → número real consultando o WhatsApp
+// Retorna null se não conseguir descobrir
+// ============================================
+async function resolveLidToPhone(sock, lidJid) {
+  if (!lidJid || !lidJid.endsWith('@lid')) return null;
+  const lid = lidJid.split('@')[0];
+
+  // 1. Já está no cache?
+  if (jidMap.has(lid)) {
+    const cached = jidMap.get(lid);
+    logger.info(`[LID] Cache hit: ${lid} → ${cached}`);
+    return cached;
+  }
+
+  // 2. Tenta via store de contatos do socket
+  try {
+    if (sock.authState?.creds?.me?.lid) {
+      // Não é o próprio usuário
+    }
+    // Busca nos contatos conhecidos do socket
+    const contacts = sock.authState?.creds?.contacts || {};
+    for (const [id, contact] of Object.entries(contacts)) {
+      if (contact?.lid && contact.lid.includes(lid)) {
+        const phone = id.split('@')[0];
+        const jid = `${phone}@s.whatsapp.net`;
+        jidMap.set(lid, jid);
+        logger.info(`[LID] Resolvido via contacts: ${lid} → ${jid}`);
+        return jid;
+      }
+    }
+  } catch (e) {
+    logger.warn(`[LID] Erro ao buscar em contacts: ${e.message}`);
+  }
+
+  logger.warn(`[LID] Não foi possível resolver ${lid}`);
+  return null;
+}
+
 function resolveJid(phone) {
   if (!phone) return null;
   const cleaned = phone.replace(/\D/g, '').split('@')[0].split(':')[0];
@@ -323,9 +362,36 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       }
 
       const isFromMe = msg.key.fromMe === true;
-
       const senderPn = msg.key.senderPn || msg.key.participant || '';
-      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
+
+      // ============================================
+      // RESOLUÇÃO DE @lid → número real
+      // Se o WhatsApp mandou só @lid sem senderPn,
+      // tenta descobrir o número real antes do webhook.
+      // ============================================
+      let effectiveJid = remoteJid;
+      let resolvedPhone = null;
+
+      if (remoteJid.endsWith('@lid')) {
+        if (senderPn) {
+          const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
+          resolvedPhone = `${phone}@s.whatsapp.net`;
+          effectiveJid = resolvedPhone;
+          const lid = remoteJid.split('@')[0];
+          jidMap.set(lid, resolvedPhone);
+          logger.info(`[${sessionId}] [LID] Via senderPn: ${lid} → ${resolvedPhone}`);
+        } else {
+          resolvedPhone = await resolveLidToPhone(sock, remoteJid);
+          if (resolvedPhone) {
+            effectiveJid = resolvedPhone;
+            logger.info(`[${sessionId}] [LID] Resolvido: ${remoteJid} → ${effectiveJid}`);
+          } else {
+            logger.warn(`[${sessionId}] [LID] Nao resolvido, mantendo ${remoteJid}`);
+          }
+        }
+      }
+
+      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} effective=${effectiveJid} senderPn=${senderPn} fromMe=${isFromMe}`);
 
       if (!isFromMe) {
         saveJidFromMessage(remoteJid, senderPn);
@@ -355,18 +421,26 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
       }
 
+      // Envia webhook com JID resolvido (número real quando disponível)
+      const webhookKey = {
+        ...msg.key,
+        remoteJid: effectiveJid,
+        originalJid: remoteJid !== effectiveJid ? remoteJid : undefined,
+      };
+
       await sendWebhook({
         event: 'received-message',
         sessionId,
         instanceId: sessionId,
         data: {
-          key: msg.key,
+          key: webhookKey,
           message: msg.message,
           messageTimestamp: msg.messageTimestamp,
           pushName: msg.pushName,
           fromMe: isFromMe,
           audioBase64,
           audioMimetype,
+          resolvedPhone: resolvedPhone ? resolvedPhone.split('@')[0] : null,
         }
       });
     }
