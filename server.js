@@ -426,6 +426,9 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         ...msg.key,
         remoteJid: effectiveJid,
         originalJid: remoteJid !== effectiveJid ? remoteJid : undefined,
+        // Garante que senderPn sempre vai no payload quando disponível
+        senderPn: senderPn || msg.key.senderPn || undefined,
+        lid: remoteJid.endsWith('@lid') ? remoteJid : undefined,
       };
 
       await sendWebhook({
@@ -648,6 +651,125 @@ app.post('/send-link-button', async (req, res) => {
     res.json({ success: true, jid, type: 'link_button' });
   } catch (error) {
     logger.error(`Erro /send-link-button: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// RESOLVE LID → número real
+// GET /resolve-lid?sessionId=...&lid=...
+// ============================================
+app.get('/resolve-lid', async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId || 'default';
+    const lidRaw = req.query.lid;
+    if (!lidRaw) return res.status(400).json({ error: 'lid é obrigatório' });
+
+    const sessionData = sessions.get(sessionId);
+    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
+      return res.status(400).json({ error: 'WhatsApp não conectado' });
+    }
+    const sock = sessionData.sock;
+
+    // Normaliza: aceita "123@lid" ou só "123"
+    const lid = String(lidRaw).replace('@lid', '').replace(/\D/g, '');
+    const lidJid = `${lid}@lid`;
+
+    logger.info(`[${sessionId}] [RESOLVE-LID] Buscando ${lid}`);
+
+    // 1. Cache local
+    if (jidMap.has(lid)) {
+      const cached = jidMap.get(lid);
+      const phone = cached.split('@')[0];
+      logger.info(`[${sessionId}] [RESOLVE-LID] Cache: ${lid} → ${phone}`);
+      return res.json({ phone, jid: cached, source: 'cache' });
+    }
+
+    // 2. signalRepository.lidMapping (Baileys 6.7.18+)
+    try {
+      const lidMapping = sock.signalRepository?.lidMapping;
+      if (lidMapping?.getPNForLID) {
+        const pn = await lidMapping.getPNForLID(lidJid);
+        if (pn) {
+          const phone = String(pn).split('@')[0].replace(/\D/g, '');
+          const jid = `${phone}@s.whatsapp.net`;
+          jidMap.set(lid, jid);
+          logger.info(`[${sessionId}] [RESOLVE-LID] lidMapping: ${lid} → ${phone}`);
+          return res.json({ phone, jid, source: 'lidMapping' });
+        }
+      }
+    } catch (e) {
+      logger.warn(`[${sessionId}] [RESOLVE-LID] lidMapping falhou: ${e.message}`);
+    }
+
+    // 3. Store de contatos do socket
+    try {
+      const contacts = sock.authState?.creds?.contacts || {};
+      for (const [id, contact] of Object.entries(contacts)) {
+        const contactLid = contact?.lid ? String(contact.lid).replace('@lid', '').replace(/\D/g, '') : null;
+        if (contactLid === lid) {
+          const phone = id.split('@')[0].replace(/\D/g, '');
+          const jid = `${phone}@s.whatsapp.net`;
+          jidMap.set(lid, jid);
+          logger.info(`[${sessionId}] [RESOLVE-LID] contacts: ${lid} → ${phone}`);
+          return res.json({ phone, jid, source: 'contacts' });
+        }
+      }
+    } catch (e) {
+      logger.warn(`[${sessionId}] [RESOLVE-LID] contacts falhou: ${e.message}`);
+    }
+
+    logger.warn(`[${sessionId}] [RESOLVE-LID] Não encontrado: ${lid}`);
+    return res.json({ phone: null, jid: null, source: 'not_found' });
+  } catch (error) {
+    logger.error(`Erro /resolve-lid: ${error.message}`);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// ON WHATSAPP — verifica se número existe
+// POST /on-whatsapp { sessionId, jid|phone }
+// ============================================
+app.post('/on-whatsapp', async (req, res) => {
+  try {
+    const { sessionId, jid, phone } = req.body;
+    const sid = sessionId || 'default';
+    const target = jid || phone;
+    if (!target) return res.status(400).json({ error: 'jid ou phone é obrigatório' });
+
+    const sessionData = sessions.get(sid);
+    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
+      return res.status(400).json({ error: 'WhatsApp não conectado' });
+    }
+    const sock = sessionData.sock;
+
+    const cleaned = String(target).replace(/\D/g, '');
+    logger.info(`[${sid}] [ON-WHATSAPP] Verificando ${cleaned}`);
+
+    const results = await sock.onWhatsApp(cleaned);
+    if (!results || results.length === 0) {
+      return res.json({ exists: false, jid: null });
+    }
+
+    const first = results[0];
+    const resolvedJid = first.jid || first.id;
+    const exists = first.exists !== false;
+
+    if (exists && resolvedJid) {
+      const p = resolvedJid.split('@')[0].replace(/\D/g, '');
+      jidMap.set(p, resolvedJid);
+      // Se veio lid junto, mapeia também
+      if (first.lid) {
+        const l = String(first.lid).replace('@lid', '').replace(/\D/g, '');
+        jidMap.set(l, resolvedJid);
+      }
+    }
+
+    logger.info(`[${sid}] [ON-WHATSAPP] ${cleaned} → exists=${exists} jid=${resolvedJid}`);
+    return res.json({ exists, jid: resolvedJid, phone: resolvedJid ? resolvedJid.split('@')[0] : null });
+  } catch (error) {
+    logger.error(`Erro /on-whatsapp: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
