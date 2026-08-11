@@ -327,19 +327,62 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   sock.ev.on('creds.update', saveCreds);
 
   // ============================================
+  // Helper: registra par lid<->phone no jidMap
+  // ============================================
+  function registerLidPhonePair(lidLike, phoneLike, origin) {
+    try {
+      if (!lidLike || !phoneLike) return;
+      const lid = String(lidLike).replace('@lid', '').replace(/\D/g, '');
+      const phone = String(phoneLike).replace('@s.whatsapp.net', '').replace(/\D/g, '');
+      if (!lid || !phone) return;
+      const jid = `${phone}@s.whatsapp.net`;
+      const already = jidMap.get(lid);
+      jidMap.set(lid, jid);
+      jidMap.set(phone, jid);
+      if (already !== jid) {
+        logger.info(`[${sessionId}] [MAP:${origin}] lid=${lid} → ${jid}`);
+      }
+    } catch (e) {
+      logger.warn(`[${sessionId}] registerLidPhonePair erro: ${e.message}`);
+    }
+  }
+
+  // ============================================
   // CONTACTS UPSERT — popula jidMap com @lid
   // ============================================
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const contact of contacts) {
-      if (contact.id && contact.id.endsWith('@s.whatsapp.net')) {
-        const phone = contact.id.split('@')[0];
-        jidMap.set(phone, contact.id);
-        if (contact.lid) {
-          const lid = contact.lid.split('@')[0];
-          jidMap.set(lid, contact.id);
-          logger.info(`[${sessionId}] [CONTACT] lid=${lid} → ${contact.id}`);
-        }
+      if (contact.id && contact.id.endsWith('@s.whatsapp.net') && contact.lid) {
+        registerLidPhonePair(contact.lid, contact.id, 'contacts.upsert');
       }
+    }
+  });
+
+  // ============================================
+  // CONTACTS UPDATE — WhatsApp manda atualizações
+  // de lid/pn frequentemente por aqui, não só no upsert
+  // ============================================
+  sock.ev.on('contacts.update', (updates) => {
+    for (const update of updates) {
+      if (update.lid && update.id) {
+        registerLidPhonePair(update.lid, update.id, 'contacts.update');
+      }
+    }
+  });
+
+  // ============================================
+  // MESSAGING-HISTORY.SET — sync inicial traz
+  // contatos completos com lid<->pn quando disponível
+  // ============================================
+  sock.ev.on('messaging-history.set', ({ contacts }) => {
+    if (!Array.isArray(contacts)) return;
+    for (const contact of contacts) {
+      if (contact?.id && contact?.lid) {
+        registerLidPhonePair(contact.lid, contact.id, 'history.set');
+      }
+    }
+    if (contacts.length > 0) {
+      logger.info(`[${sessionId}] [HISTORY] ${contacts.length} contatos processados, jidMap agora tem ${jidMap.size} entradas`);
     }
   });
 
