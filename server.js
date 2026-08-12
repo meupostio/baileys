@@ -362,25 +362,44 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       }
 
       const isFromMe = msg.key.fromMe === true;
-      const senderPn = msg.key.senderPn || msg.key.participant || '';
 
-      // Fontes extras de mapeamento direto na mensagem, quando existirem
+      // ============================================
+      // remoteJidAlt / participantAlt — campos que o
+      // próprio WhatsApp/Baileys usa para carregar o
+      // identificador "alternativo": quando remoteJid é
+      // @lid, o remoteJidAlt normalmente traz o @s.whatsapp.net
+      // real correspondente. É a fonte MAIS confiável,
+      // vem direto do protocolo, sem precisar adivinhar.
+      // ============================================
+      const remoteJidAlt = msg.key.remoteJidAlt || '';
+      const participantAlt = msg.key.participantAlt || '';
+      const senderPn = msg.key.senderPn || msg.key.participant || participantAlt || '';
+
+      // Se remoteJid é @lid e o Alt é um telefone real, registra o par
+      if (remoteJid.endsWith('@lid') && remoteJidAlt.endsWith('@s.whatsapp.net')) {
+        registerLidPhonePair(remoteJid, remoteJidAlt, 'remoteJidAlt');
+      }
       if (msg.key.senderLid && senderPn) {
         registerLidPhonePair(msg.key.senderLid, senderPn, 'msg.senderLid');
       }
 
-      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
+      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} remoteJidAlt=${remoteJidAlt} senderPn=${senderPn} fromMe=${isFromMe}`);
 
       // Salva mapeamento a partir da própria mensagem (mecanismo original que funcionava)
       if (!isFromMe) {
         saveJidFromMessage(remoteJid, senderPn);
       }
 
-      // Resolve para exibição/webhook usando SÓ o cache (sem chamadas arriscadas)
+      // Resolve para exibição/webhook: prioriza remoteJidAlt (direto do protocolo),
+      // depois cache já conhecido
       let effectiveJid = remoteJid;
       if (remoteJid.endsWith('@lid')) {
-        const cached = resolveLidFromCache(remoteJid);
-        if (cached) effectiveJid = cached;
+        if (remoteJidAlt.endsWith('@s.whatsapp.net')) {
+          effectiveJid = remoteJidAlt;
+        } else {
+          const cached = resolveLidFromCache(remoteJid);
+          if (cached) effectiveJid = cached;
+        }
       }
 
       const msgType = Object.keys(msg.message)[0];
@@ -644,16 +663,35 @@ app.post('/send-link-button', async (req, res) => {
 async function handleResolveLid(req, res) {
   try {
     const params = req.method === 'POST' ? req.body : req.query;
+    const sessionId = params.sessionId || 'default';
     const lidRaw = params.lid;
     if (!lidRaw) return res.status(400).json({ error: 'lid é obrigatório' });
 
     const lid = String(lidRaw).replace('@lid', '').replace(/\D/g, '');
-    const cached = jidMap.get(lid);
 
+    // 1. Cache
+    const cached = jidMap.get(lid);
     if (cached) {
       const phone = cached.split('@')[0];
       return res.json({ phone, jid: cached, source: 'cache' });
     }
+
+    // 2. Consulta ATIVA ao WhatsApp via onWhatsApp — só quando o cache falha
+    const sessionData = sessions.get(sessionId);
+    if (sessionData?.sock && sessionData.connectionStatus === 'connected') {
+      try {
+        const results = await sessionData.sock.onWhatsApp(`${lid}@lid`);
+        const first = results?.[0];
+        if (first?.jid && first.jid.endsWith('@s.whatsapp.net')) {
+          const phone = first.jid.split('@')[0];
+          registerLidPhonePair(lid, first.jid, 'onWhatsApp-active');
+          return res.json({ phone, jid: first.jid, source: 'active_query' });
+        }
+      } catch (e) {
+        logger.warn(`[${sessionId}] [RESOLVE-LID] onWhatsApp ativo falhou: ${e.message}`);
+      }
+    }
+
     return res.json({ phone: null, jid: null, source: 'not_found' });
   } catch (error) {
     logger.error(`Erro /resolve-lid: ${error.message}`);
