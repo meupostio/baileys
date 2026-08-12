@@ -1,5 +1,6 @@
 // ============================================
 // SERVIDOR BAILEYS MULTI-USUÁRIO
+// Versão consolidada — apenas mudanças confirmadas
 // ============================================
 const { 
   makeWASocket, 
@@ -25,37 +26,6 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const sessions = new Map();
 const jidMap = new Map();
-const JIDMAP_FILE = path.join(__dirname, 'auth_info', 'jidmap.json');
-let persistDebounceTimer = null;
-
-function loadJidMapFromDisk() {
-  try {
-    if (fs.existsSync(JIDMAP_FILE)) {
-      const raw = fs.readFileSync(JIDMAP_FILE, 'utf-8');
-      const obj = JSON.parse(raw);
-      for (const [k, v] of Object.entries(obj)) {
-        jidMap.set(k, v);
-      }
-      console.log(`[JIDMAP] Carregado do disco: ${jidMap.size} entradas`);
-    }
-  } catch (e) {
-    console.error('[JIDMAP] Erro ao carregar do disco:', e.message);
-  }
-}
-
-function persistJidMap() {
-  clearTimeout(persistDebounceTimer);
-  persistDebounceTimer = setTimeout(() => {
-    try {
-      const dir = path.dirname(JIDMAP_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const obj = Object.fromEntries(jidMap.entries());
-      fs.writeFileSync(JIDMAP_FILE, JSON.stringify(obj), 'utf-8');
-    } catch (e) {
-      console.error('[JIDMAP] Erro ao persistir:', e.message);
-    }
-  }, 2000); // debounce de 2s
-}
 
 // ============================================
 // CAPTURA ERROS — evita crash do processo
@@ -76,7 +46,8 @@ const logger = P({
 });
 
 // ============================================
-// JID HELPERS
+// JID HELPERS — igual à versão original que
+// identificava números corretamente
 // ============================================
 function saveJidFromMessage(remoteJid, senderPn) {
   if (!remoteJid) return;
@@ -84,6 +55,7 @@ function saveJidFromMessage(remoteJid, senderPn) {
   if (remoteJid === 'status@broadcast') return;
   if (remoteJid.endsWith('@newsletter')) return;
   if (remoteJid.endsWith('@broadcast')) return;
+
   if (remoteJid.endsWith('@lid') && senderPn) {
     const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
     const jidToUse = senderPn.includes('@') ? senderPn : `${phone}@s.whatsapp.net`;
@@ -91,66 +63,10 @@ function saveJidFromMessage(remoteJid, senderPn) {
     const lid = remoteJid.split('@')[0];
     jidMap.set(lid, jidToUse);
     logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
-    persistJidMap();
   } else if (remoteJid.endsWith('@s.whatsapp.net')) {
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    if (!jidMap.has(phone)) {
-      jidMap.set(phone, remoteJid);
-      persistJidMap();
-    }
+    if (!jidMap.has(phone)) jidMap.set(phone, remoteJid);
   }
-}
-
-// ============================================
-// Resolve @lid → número real consultando o WhatsApp
-// Retorna null se não conseguir descobrir
-// ============================================
-async function resolveLidToPhone(sock, lidJid) {
-  if (!lidJid || !lidJid.endsWith('@lid')) return null;
-  const lid = lidJid.split('@')[0];
-
-  // 1. Cache local
-  if (jidMap.has(lid)) {
-    const cached = jidMap.get(lid);
-    logger.info(`[LID] Cache hit: ${lid} → ${cached}`);
-    return cached;
-  }
-
-  // 2. signalRepository.lidMapping — fonte correta no Baileys 6.7.x
-  try {
-    const lidMapping = sock.signalRepository?.lidMapping;
-    if (lidMapping?.getPNForLID) {
-      const pn = await lidMapping.getPNForLID(`${lid}@lid`);
-      if (pn) {
-        const phone = String(pn).split('@')[0].replace(/\D/g, '');
-        const jid = `${phone}@s.whatsapp.net`;
-        jidMap.set(lid, jid);
-        jidMap.set(phone, jid);
-        persistJidMap();
-        logger.info(`[LID] signalRepository: ${lid} → ${jid}`);
-        return jid;
-      }
-    }
-    // Tenta em lote também, algumas versões só implementam o plural
-    if (lidMapping?.getPNForLIDs) {
-      const results = await lidMapping.getPNForLIDs([`${lid}@lid`]);
-      const pn = results?.[`${lid}@lid`] || results?.[0];
-      if (pn) {
-        const phone = String(pn).split('@')[0].replace(/\D/g, '');
-        const jid = `${phone}@s.whatsapp.net`;
-        jidMap.set(lid, jid);
-        jidMap.set(phone, jid);
-        persistJidMap();
-        logger.info(`[LID] signalRepository (batch): ${lid} → ${jid}`);
-        return jid;
-      }
-    }
-  } catch (e) {
-    logger.warn(`[LID] signalRepository falhou: ${e.message}`);
-  }
-
-  logger.warn(`[LID] Não foi possível resolver ${lid}`);
-  return null;
 }
 
 function resolveJid(phone) {
@@ -163,6 +79,33 @@ function resolveJid(phone) {
   }
   if (phone.includes('@g.us')) return `${cleaned}@g.us`;
   return `${cleaned}@s.whatsapp.net`;
+}
+
+// Registra par lid<->phone vindo de qualquer fonte (contatos, histórico)
+function registerLidPhonePair(lidLike, phoneLike, origin) {
+  try {
+    if (!lidLike || !phoneLike) return;
+    const lid = String(lidLike).replace('@lid', '').replace(/\D/g, '');
+    const phone = String(phoneLike).replace('@s.whatsapp.net', '').replace(/\D/g, '');
+    if (!lid || !phone) return;
+    const jid = `${phone}@s.whatsapp.net`;
+    const already = jidMap.get(lid);
+    jidMap.set(lid, jid);
+    jidMap.set(phone, jid);
+    if (already !== jid) {
+      logger.info(`[MAP:${origin}] lid=${lid} → ${jid}`);
+    }
+  } catch (e) {
+    logger.warn(`registerLidPhonePair erro: ${e.message}`);
+  }
+}
+
+// Tenta resolver @lid usando SOMENTE o cache já conhecido
+// (sem chamadas experimentais à API interna do Baileys)
+function resolveLidFromCache(lidJid) {
+  if (!lidJid) return null;
+  const lid = String(lidJid).replace('@lid', '');
+  return jidMap.get(lid) || null;
 }
 
 // ============================================
@@ -217,7 +160,7 @@ async function getOrCreateSession(sessionId) {
     authState: null,
     phoneNumber: null,
     reconnectAttempts: 0,
-    keepAliveInterval: null,   // ← keep-alive
+    keepAliveInterval: null,
   };
   const authDir = path.join(__dirname, 'auth_info', sessionId);
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
@@ -231,7 +174,6 @@ async function cleanupSession(sessionId) {
   if (!sessionData) return;
   logger.info(`[${sessionId}] Iniciando cleanup...`);
 
-  // Cancela keep-alive
   if (sessionData.keepAliveInterval) {
     clearInterval(sessionData.keepAliveInterval);
     sessionData.keepAliveInterval = null;
@@ -281,11 +223,10 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     auth: state,
     printQRInTerminal: options.printQR !== false,
     logger: P({ level: 'silent' }),
-    // Identifica como WhatsApp Web oficial — evita invalidação de sessão
+    // Identifica como WhatsApp Web oficial — evita "Aguardando mensagem"
     browser: ['WhatsApp Web', 'Chrome', '2.2412.54'],
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
-    // Necessário para re-cifrar mensagens sem fechar sessão
     getMessage: async (key) => {
       return { conversation: '' };
     },
@@ -314,11 +255,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       sessionData.reconnectAttempts = 0;
       logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
 
-      // ============================================
-      // KEEP-ALIVE — mantém sessão de criptografia
-      // ativa enviando presença a cada 3 minutos.
-      // Evita o "Aguardando mensagem" por inatividade.
-      // ============================================
+      // Keep-alive — evita "Aguardando mensagem" por inatividade
       if (sessionData.keepAliveInterval) {
         clearInterval(sessionData.keepAliveInterval);
       }
@@ -331,7 +268,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         } catch (e) {
           logger.warn(`[${sessionId}] 💔 Keep-alive falhou: ${e.message}`);
         }
-      }, 3 * 60 * 1000); // a cada 3 minutos
+      }, 3 * 60 * 1000);
 
       await sendWebhook({
         event: 'status-updated', sessionId,
@@ -345,7 +282,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       logger.warn(`[${sessionId}] ❌ Conexão fechada (código: ${statusCode})`);
 
-      // Cancela keep-alive ao desconectar
       if (sessionData.keepAliveInterval) {
         clearInterval(sessionData.keepAliveInterval);
         sessionData.keepAliveInterval = null;
@@ -375,29 +311,8 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   sock.ev.on('creds.update', saveCreds);
 
   // ============================================
-  // Helper: registra par lid<->phone no jidMap
-  // ============================================
-  function registerLidPhonePair(lidLike, phoneLike, origin) {
-    try {
-      if (!lidLike || !phoneLike) return;
-      const lid = String(lidLike).replace('@lid', '').replace(/\D/g, '');
-      const phone = String(phoneLike).replace('@s.whatsapp.net', '').replace(/\D/g, '');
-      if (!lid || !phone) return;
-      const jid = `${phone}@s.whatsapp.net`;
-      const already = jidMap.get(lid);
-      jidMap.set(lid, jid);
-      jidMap.set(phone, jid);
-      if (already !== jid) {
-        logger.info(`[${sessionId}] [MAP:${origin}] lid=${lid} → ${jid}`);
-        persistJidMap();
-      }
-    } catch (e) {
-      logger.warn(`[${sessionId}] registerLidPhonePair erro: ${e.message}`);
-    }
-  }
-
-  // ============================================
-  // CONTACTS UPSERT — popula jidMap com @lid
+  // Fontes ADITIVAS de mapeamento lid<->phone
+  // (não bloqueiam nada, só alimentam o cache)
   // ============================================
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const contact of contacts) {
@@ -407,10 +322,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     }
   });
 
-  // ============================================
-  // CONTACTS UPDATE — WhatsApp manda atualizações
-  // de lid/pn frequentemente por aqui, não só no upsert
-  // ============================================
   sock.ev.on('contacts.update', (updates) => {
     for (const update of updates) {
       if (update.lid && update.id) {
@@ -419,19 +330,17 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     }
   });
 
-  // ============================================
-  // MESSAGING-HISTORY.SET — sync inicial traz
-  // contatos completos com lid<->pn quando disponível
-  // ============================================
   sock.ev.on('messaging-history.set', ({ contacts }) => {
     if (!Array.isArray(contacts)) return;
+    let count = 0;
     for (const contact of contacts) {
       if (contact?.id && contact?.lid) {
         registerLidPhonePair(contact.lid, contact.id, 'history.set');
+        count++;
       }
     }
-    if (contacts.length > 0) {
-      logger.info(`[${sessionId}] [HISTORY] ${contacts.length} contatos processados, jidMap agora tem ${jidMap.size} entradas`);
+    if (count > 0) {
+      logger.info(`[${sessionId}] [HISTORY] ${count} contatos com lid mapeados, cache total: ${jidMap.size}`);
     }
   });
 
@@ -449,55 +358,29 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         remoteJid.endsWith('@broadcast') ||
         remoteJid === 'status@broadcast'
       ) {
-        logger.info(`[${sessionId}] ⏭️ Ignorado: ${remoteJid}`);
         continue;
       }
 
       const isFromMe = msg.key.fromMe === true;
       const senderPn = msg.key.senderPn || msg.key.participant || '';
 
-      // Captura fontes extras de mapeamento lid<->pn que vêm na própria mensagem
-      if (msg.key.senderLid && msg.key.senderPn) {
-        registerLidPhonePair(msg.key.senderLid, msg.key.senderPn, 'msg.senderLid');
-      }
-      if (msg.key.participantLid && msg.key.participantPn) {
-        registerLidPhonePair(msg.key.participantLid, msg.key.participantPn, 'msg.participantLid');
-      }
-      if (remoteJid.endsWith('@lid') && msg.key.participantPn) {
-        registerLidPhonePair(remoteJid, msg.key.participantPn, 'msg.remoteJid+participantPn');
+      // Fontes extras de mapeamento direto na mensagem, quando existirem
+      if (msg.key.senderLid && senderPn) {
+        registerLidPhonePair(msg.key.senderLid, senderPn, 'msg.senderLid');
       }
 
-      // ============================================
-      // RESOLUÇÃO DE @lid → número real
-      // Se o WhatsApp mandou só @lid sem senderPn,
-      // tenta descobrir o número real antes do webhook.
-      // ============================================
-      let effectiveJid = remoteJid;
-      let resolvedPhone = null;
+      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
 
-      if (remoteJid.endsWith('@lid')) {
-        if (senderPn) {
-          const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
-          resolvedPhone = `${phone}@s.whatsapp.net`;
-          effectiveJid = resolvedPhone;
-          const lid = remoteJid.split('@')[0];
-          jidMap.set(lid, resolvedPhone);
-          logger.info(`[${sessionId}] [LID] Via senderPn: ${lid} → ${resolvedPhone}`);
-        } else {
-          resolvedPhone = await resolveLidToPhone(sock, remoteJid);
-          if (resolvedPhone) {
-            effectiveJid = resolvedPhone;
-            logger.info(`[${sessionId}] [LID] Resolvido: ${remoteJid} → ${effectiveJid}`);
-          } else {
-            logger.warn(`[${sessionId}] [LID] Nao resolvido, mantendo ${remoteJid}`);
-          }
-        }
-      }
-
-      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} effective=${effectiveJid} senderPn=${senderPn} fromMe=${isFromMe}`);
-
+      // Salva mapeamento a partir da própria mensagem (mecanismo original que funcionava)
       if (!isFromMe) {
         saveJidFromMessage(remoteJid, senderPn);
+      }
+
+      // Resolve para exibição/webhook usando SÓ o cache (sem chamadas arriscadas)
+      let effectiveJid = remoteJid;
+      if (remoteJid.endsWith('@lid')) {
+        const cached = resolveLidFromCache(remoteJid);
+        if (cached) effectiveJid = cached;
       }
 
       const msgType = Object.keys(msg.message)[0];
@@ -507,7 +390,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       } else if (msgType === 'extendedTextMessage') {
         content = msg.message.extendedTextMessage?.text || '';
       }
-      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} ${remoteJid}: ${content}`);
+      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} ${effectiveJid}: ${content}`);
 
       let audioBase64 = null;
       let audioMimetype = null;
@@ -524,14 +407,11 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
       }
 
-      // Envia webhook com JID resolvido (número real quando disponível)
       const webhookKey = {
         ...msg.key,
         remoteJid: effectiveJid,
         originalJid: remoteJid !== effectiveJid ? remoteJid : undefined,
-        // Garante que senderPn sempre vai no payload quando disponível
-        senderPn: senderPn || msg.key.senderPn || undefined,
-        lid: remoteJid.endsWith('@lid') ? remoteJid : undefined,
+        senderPn: senderPn || undefined,
       };
 
       await sendWebhook({
@@ -546,7 +426,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           fromMe: isFromMe,
           audioBase64,
           audioMimetype,
-          resolvedPhone: resolvedPhone ? resolvedPhone.split('@')[0] : null,
         }
       });
     }
@@ -577,7 +456,7 @@ app.post('/create-session', async (req, res) => {
     }
     return res.json({ success: true, status: sessionData.connectionStatus });
   } catch (error) {
-    logger.error(`Erro /create-session: ${error.message}`, error.stack);
+    logger.error(`Erro /create-session: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
@@ -759,145 +638,30 @@ app.post('/send-link-button', async (req, res) => {
 });
 
 // ============================================
-// RESOLVE LID → número real
-// GET /resolve-lid?sessionId=...&lid=...
+// RESOLVE LID — versão simples, só cache
+// GET ou POST, sempre responde algo previsível
 // ============================================
 async function handleResolveLid(req, res) {
   try {
     const params = req.method === 'POST' ? req.body : req.query;
-    const sessionId = params.sessionId || 'default';
     const lidRaw = params.lid;
     if (!lidRaw) return res.status(400).json({ error: 'lid é obrigatório' });
 
-    const sessionData = sessions.get(sessionId);
-    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
-      return res.status(400).json({ error: 'WhatsApp não conectado' });
-    }
-    const sock = sessionData.sock;
-
-    // Normaliza: aceita "123@lid" ou só "123"
     const lid = String(lidRaw).replace('@lid', '').replace(/\D/g, '');
-    const lidJid = `${lid}@lid`;
+    const cached = jidMap.get(lid);
 
-    logger.info(`[${sessionId}] [RESOLVE-LID] Buscando ${lid}`);
-
-    // 1. Cache local
-    if (jidMap.has(lid)) {
-      const cached = jidMap.get(lid);
+    if (cached) {
       const phone = cached.split('@')[0];
-      logger.info(`[${sessionId}] [RESOLVE-LID] Cache: ${lid} → ${phone}`);
       return res.json({ phone, jid: cached, source: 'cache' });
     }
-
-    // 2. signalRepository.lidMapping (Baileys 6.7.18+)
-    try {
-      const lidMapping = sock.signalRepository?.lidMapping;
-      if (lidMapping?.getPNForLID) {
-        const pn = await lidMapping.getPNForLID(lidJid);
-        if (pn) {
-          const phone = String(pn).split('@')[0].replace(/\D/g, '');
-          const jid = `${phone}@s.whatsapp.net`;
-          jidMap.set(lid, jid);
-          logger.info(`[${sessionId}] [RESOLVE-LID] lidMapping: ${lid} → ${phone}`);
-          return res.json({ phone, jid, source: 'lidMapping' });
-        }
-      }
-    } catch (e) {
-      logger.warn(`[${sessionId}] [RESOLVE-LID] lidMapping falhou: ${e.message}`);
-    }
-
-    // 3. Store de contatos do socket
-    try {
-      const contacts = sock.authState?.creds?.contacts || {};
-      for (const [id, contact] of Object.entries(contacts)) {
-        const contactLid = contact?.lid ? String(contact.lid).replace('@lid', '').replace(/\D/g, '') : null;
-        if (contactLid === lid) {
-          const phone = id.split('@')[0].replace(/\D/g, '');
-          const jid = `${phone}@s.whatsapp.net`;
-          jidMap.set(lid, jid);
-          logger.info(`[${sessionId}] [RESOLVE-LID] contacts: ${lid} → ${phone}`);
-          return res.json({ phone, jid, source: 'contacts' });
-        }
-      }
-    } catch (e) {
-      logger.warn(`[${sessionId}] [RESOLVE-LID] contacts falhou: ${e.message}`);
-    }
-
-    logger.warn(`[${sessionId}] [RESOLVE-LID] Não encontrado: ${lid}`);
     return res.json({ phone: null, jid: null, source: 'not_found' });
   } catch (error) {
     logger.error(`Erro /resolve-lid: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 }
-
 app.get('/resolve-lid', handleResolveLid);
 app.post('/resolve-lid', handleResolveLid);
-
-// ============================================
-// ON WHATSAPP — verifica se número existe
-// POST /on-whatsapp { sessionId, jid|phone }
-// ============================================
-app.post('/on-whatsapp', async (req, res) => {
-  try {
-    const { sessionId, jid, phone, lid } = req.body;
-    const sid = sessionId || 'default';
-    let target = jid || phone;
-
-    const sessionData = sessions.get(sid);
-    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
-      return res.status(400).json({ error: 'WhatsApp não conectado' });
-    }
-    const sock = sessionData.sock;
-
-    // Se veio um @lid explícito, ou o "target" parece um lid (não um telefone
-    // válido — muito longo ou sem prefixo de país plausível), tenta resolver
-    // via cache/signalRepository ANTES de consultar onWhatsApp com dígitos errados.
-    const lidCandidate = lid || (target && target.includes('@lid') ? target : null);
-    if (lidCandidate) {
-      const resolved = await resolveLidToPhone(sock, lidCandidate.includes('@lid') ? lidCandidate : `${lidCandidate.replace(/\D/g, '')}@lid`);
-      if (resolved) {
-        const p = resolved.split('@')[0];
-        return res.json({ exists: true, jid: resolved, phone: p, source: 'lid_resolved' });
-      }
-      // Não conseguiu resolver o lid — não adianta consultar onWhatsApp com o lid como número
-      if (!phone) {
-        return res.json({ exists: false, jid: null, phone: null, source: 'lid_unresolved' });
-      }
-      target = phone; // cai para tentar com o telefone, se veio um
-    }
-
-    if (!target) return res.status(400).json({ error: 'jid, phone ou lid é obrigatório' });
-
-    const cleaned = String(target).replace(/\D/g, '');
-    logger.info(`[${sid}] [ON-WHATSAPP] Verificando ${cleaned}`);
-
-    const results = await sock.onWhatsApp(cleaned);
-    if (!results || results.length === 0) {
-      return res.json({ exists: false, jid: null });
-    }
-
-    const first = results[0];
-    const resolvedJid = first.jid || first.id;
-    const exists = first.exists !== false;
-
-    if (exists && resolvedJid) {
-      const p = resolvedJid.split('@')[0].replace(/\D/g, '');
-      jidMap.set(p, resolvedJid);
-      // Se veio lid junto, mapeia também
-      if (first.lid) {
-        const l = String(first.lid).replace('@lid', '').replace(/\D/g, '');
-        jidMap.set(l, resolvedJid);
-      }
-    }
-
-    logger.info(`[${sid}] [ON-WHATSAPP] ${cleaned} → exists=${exists} jid=${resolvedJid}`);
-    return res.json({ exists, jid: resolvedJid, phone: resolvedJid ? resolvedJid.split('@')[0] : null });
-  } catch (error) {
-    logger.error(`Erro /on-whatsapp: ${error.message}`);
-    res.status(500).json({ error: error.message });
-  }
-});
 
 app.get('/status', (req, res) => {
   const allSessions = {};
@@ -906,8 +670,6 @@ app.get('/status', (req, res) => {
   });
   res.json({ success: true, uptime: process.uptime(), totalSessions: sessions.size, knownContacts: jidMap.size, sessions: allSessions });
 });
-
-loadJidMapFromDisk();
 
 app.listen(PORT, () => {
   logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
