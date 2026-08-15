@@ -390,15 +390,36 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         saveJidFromMessage(remoteJid, senderPn);
       }
 
-      // Resolve para exibição/webhook: prioriza remoteJidAlt (direto do protocolo),
-      // depois cache já conhecido
+      // Resolve para exibição/webhook, em ordem de confiabilidade:
+      // 1) remoteJidAlt (vem direto do protocolo)
+      // 2) cache já conhecido
+      // 3) consulta ATIVA ao WhatsApp (onWhatsApp) — última tentativa
       let effectiveJid = remoteJid;
       if (remoteJid.endsWith('@lid')) {
         if (remoteJidAlt.endsWith('@s.whatsapp.net')) {
           effectiveJid = remoteJidAlt;
         } else {
           const cached = resolveLidFromCache(remoteJid);
-          if (cached) effectiveJid = cached;
+          if (cached) {
+            effectiveJid = cached;
+          } else {
+            // Consulta ativa: pergunta ao WhatsApp qual o número por trás do LID.
+            // Só roda quando todas as fontes passivas falharam.
+            try {
+              const results = await sock.onWhatsApp(remoteJid);
+              const first = Array.isArray(results) ? results[0] : null;
+              const foundJid = first?.jid || first?.id;
+              if (foundJid && String(foundJid).endsWith('@s.whatsapp.net')) {
+                effectiveJid = foundJid;
+                registerLidPhonePair(remoteJid, foundJid, 'onWhatsApp-inline');
+                logger.info(`[${sessionId}] [LID] Consulta ativa resolveu: ${remoteJid} → ${foundJid}`);
+              } else {
+                logger.warn(`[${sessionId}] [LID] Consulta ativa sem resultado para ${remoteJid}`);
+              }
+            } catch (e) {
+              logger.warn(`[${sessionId}] [LID] Consulta ativa falhou: ${e.message}`);
+            }
+          }
         }
       }
 
@@ -426,25 +447,26 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
       }
 
-      const webhookKey = {
-        ...msg.key,
-        remoteJid: effectiveJid,
-        originalJid: remoteJid !== effectiveJid ? remoteJid : undefined,
-        senderPn: senderPn || undefined,
-      };
-
+      // IMPORTANTE: envia msg.key ORIGINAL, sem modificar.
+      // Os dados de resolução vão como campos ADICIONAIS,
+      // fora da key, para não quebrar o que o CRM já espera.
       await sendWebhook({
         event: 'received-message',
         sessionId,
         instanceId: sessionId,
         data: {
-          key: webhookKey,
+          key: msg.key,
           message: msg.message,
           messageTimestamp: msg.messageTimestamp,
           pushName: msg.pushName,
           fromMe: isFromMe,
           audioBase64,
           audioMimetype,
+          // Campos extras (aditivos, não substituem nada):
+          resolvedJid: effectiveJid !== remoteJid ? effectiveJid : undefined,
+          resolvedPhone: (effectiveJid !== remoteJid && effectiveJid.endsWith('@s.whatsapp.net'))
+            ? effectiveJid.split('@')[0]
+            : undefined,
         }
       });
     }
