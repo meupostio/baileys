@@ -49,23 +49,31 @@ const logger = P({
 // JID HELPERS — igual à versão original que
 // identificava números corretamente
 // ============================================
-function saveJidFromMessage(remoteJid, senderPn) {
-  if (!remoteJid) return;
+function saveJidFromMessage(msgKey) {
+  if (!msgKey) return;
+  const remoteJid    = msgKey.remoteJid || '';
+  const remoteJidAlt = msgKey.remoteJidAlt || '';
+
+  // Ignora grupos, newsletters, broadcasts e status
   if (remoteJid.endsWith('@g.us')) return;
-  if (remoteJid === 'status@broadcast') return;
   if (remoteJid.endsWith('@newsletter')) return;
   if (remoteJid.endsWith('@broadcast')) return;
+  if (remoteJid === 'status@broadcast') return;
 
-  if (remoteJid.endsWith('@lid') && senderPn) {
-    const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
-    const jidToUse = senderPn.includes('@') ? senderPn : `${phone}@s.whatsapp.net`;
-    jidMap.set(phone, jidToUse);
-    const lid = remoteJid.split('@')[0];
-    jidMap.set(lid, jidToUse);
-    logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
+  // Se veio com @lid, temos o JID novo e o número alternativo
+  if (remoteJid.endsWith('@lid') && remoteJidAlt) {
+    // Extrai o número limpo do Alt (número de telefone real)
+    const phone = remoteJidAlt.replace(/\D/g, '').split('@')[0].split(':')[0];
+    // Salva: número limpo → jid @lid (é o que o WhatsApp espera agora)
+    jidMap.set(phone, remoteJid);
+    logger.info(`[JID] Mapeado ${phone} → ${remoteJid} (LID)`);
   } else if (remoteJid.endsWith('@s.whatsapp.net')) {
+    // Sistema antigo: salva o número → jid normal
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    if (!jidMap.has(phone)) jidMap.set(phone, remoteJid);
+    // Só salva se ainda não temos mapeamento LID para esse número
+    if (!jidMap.has(phone)) {
+      jidMap.set(phone, remoteJid);
+    }
   }
 }
 
@@ -100,13 +108,6 @@ function registerLidPhonePair(lidLike, phoneLike, origin) {
   }
 }
 
-// Tenta resolver @lid usando SOMENTE o cache já conhecido
-// (sem chamadas experimentais à API interna do Baileys)
-function resolveLidFromCache(lidJid) {
-  if (!lidJid) return null;
-  const lid = String(lidJid).replace('@lid', '');
-  return jidMap.get(lid) || null;
-}
 
 // ============================================
 // AUTH
@@ -352,6 +353,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       if (!msg.message) continue;
       const remoteJid = msg.key.remoteJid || '';
 
+      // Ignora grupos, newsletters, broadcasts e status
       if (
         remoteJid.endsWith('@g.us') ||
         remoteJid.endsWith('@newsletter') ||
@@ -363,75 +365,23 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 
       const isFromMe = msg.key.fromMe === true;
 
-      // ============================================
-      // remoteJidAlt / participantAlt — campos que o
-      // próprio WhatsApp/Baileys usa para carregar o
-      // identificador "alternativo": quando remoteJid é
-      // @lid, o remoteJidAlt normalmente traz o @s.whatsapp.net
-      // real correspondente. É a fonte MAIS confiável,
-      // vem direto do protocolo, sem precisar adivinhar.
-      // ============================================
-      const remoteJidAlt = msg.key.remoteJidAlt || '';
-      const participantAlt = msg.key.participantAlt || '';
-      const senderPn = msg.key.senderPn || msg.key.participant || participantAlt || '';
-
-      // Se remoteJid é @lid e o Alt é um telefone real, registra o par
-      if (remoteJid.endsWith('@lid') && remoteJidAlt.endsWith('@s.whatsapp.net')) {
-        registerLidPhonePair(remoteJid, remoteJidAlt, 'remoteJidAlt');
-      }
-      if (msg.key.senderLid && senderPn) {
-        registerLidPhonePair(msg.key.senderLid, senderPn, 'msg.senderLid');
-      }
-
-      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} remoteJidAlt=${remoteJidAlt} senderPn=${senderPn} fromMe=${isFromMe}`);
-
-      // Salva mapeamento a partir da própria mensagem (mecanismo original que funcionava)
+      // Salva o mapeamento JID (resolve LID + contato fantasma)
+      // Só para mensagens recebidas — igual à versão original
       if (!isFromMe) {
-        saveJidFromMessage(remoteJid, senderPn);
+        saveJidFromMessage(msg.key);
       }
 
-      // Resolve para exibição/webhook, em ordem de confiabilidade:
-      // 1) remoteJidAlt (vem direto do protocolo)
-      // 2) cache já conhecido
-      // 3) consulta ATIVA ao WhatsApp (onWhatsApp) — última tentativa
-      let effectiveJid = remoteJid;
-      if (remoteJid.endsWith('@lid')) {
-        if (remoteJidAlt.endsWith('@s.whatsapp.net')) {
-          effectiveJid = remoteJidAlt;
-        } else {
-          const cached = resolveLidFromCache(remoteJid);
-          if (cached) {
-            effectiveJid = cached;
-          } else {
-            // Consulta ativa: pergunta ao WhatsApp qual o número por trás do LID.
-            // Só roda quando todas as fontes passivas falharam.
-            try {
-              const results = await sock.onWhatsApp(remoteJid);
-              const first = Array.isArray(results) ? results[0] : null;
-              const foundJid = first?.jid || first?.id;
-              if (foundJid && String(foundJid).endsWith('@s.whatsapp.net')) {
-                effectiveJid = foundJid;
-                registerLidPhonePair(remoteJid, foundJid, 'onWhatsApp-inline');
-                logger.info(`[${sessionId}] [LID] Consulta ativa resolveu: ${remoteJid} → ${foundJid}`);
-              } else {
-                logger.warn(`[${sessionId}] [LID] Consulta ativa sem resultado para ${remoteJid}`);
-              }
-            } catch (e) {
-              logger.warn(`[${sessionId}] [LID] Consulta ativa falhou: ${e.message}`);
-            }
-          }
-        }
-      }
-
-      const msgType = Object.keys(msg.message)[0];
+      const messageType = Object.keys(msg.message)[0];
       let content = '';
-      if (msgType === 'conversation') {
+      if (messageType === 'conversation') {
         content = msg.message.conversation;
-      } else if (msgType === 'extendedTextMessage') {
+      } else if (messageType === 'extendedTextMessage') {
         content = msg.message.extendedTextMessage?.text || '';
       }
-      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} ${effectiveJid}: ${content}`);
 
+      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} ${remoteJid}: ${content}`);
+
+      // Download de áudio
       let audioBase64 = null;
       let audioMimetype = null;
       if (msg.message.audioMessage) {
@@ -447,9 +397,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
       }
 
-      // IMPORTANTE: envia msg.key ORIGINAL, sem modificar.
-      // Os dados de resolução vão como campos ADICIONAIS,
-      // fora da key, para não quebrar o que o CRM já espera.
+      // Payload IDÊNTICO ao original — msg.key puro, sem modificação
       await sendWebhook({
         event: 'received-message',
         sessionId,
@@ -462,11 +410,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           fromMe: isFromMe,
           audioBase64,
           audioMimetype,
-          // Campos extras (aditivos, não substituem nada):
-          resolvedJid: effectiveJid !== remoteJid ? effectiveJid : undefined,
-          resolvedPhone: (effectiveJid !== remoteJid && effectiveJid.endsWith('@s.whatsapp.net'))
-            ? effectiveJid.split('@')[0]
-            : undefined,
         }
       });
     }
