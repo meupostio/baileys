@@ -25,7 +25,39 @@ const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const sessions = new Map();
-const jidMap = new Map();
+const jidMap = new Map(); // phone_limpo -> jid_para_responder
+
+// ============================================
+// PERSISTÊNCIA — sobrevive a restart/hibernação do Render
+// ============================================
+const JIDMAP_FILE = path.join(__dirname, 'auth_info', 'jidmap.json');
+let persistDebounceTimer = null;
+
+function loadJidMapFromDisk() {
+  try {
+    if (fs.existsSync(JIDMAP_FILE)) {
+      const raw = fs.readFileSync(JIDMAP_FILE, 'utf-8');
+      const obj = JSON.parse(raw);
+      for (const [k, v] of Object.entries(obj)) jidMap.set(k, v);
+      console.log(`[JIDMAP] Carregado do disco: ${jidMap.size} entradas`);
+    }
+  } catch (e) {
+    console.error('[JIDMAP] Erro ao carregar:', e.message);
+  }
+}
+
+function persistJidMap() {
+  clearTimeout(persistDebounceTimer);
+  persistDebounceTimer = setTimeout(() => {
+    try {
+      const dir = path.dirname(JIDMAP_FILE);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(JIDMAP_FILE, JSON.stringify(Object.fromEntries(jidMap)), 'utf-8');
+    } catch (e) {
+      console.error('[JIDMAP] Erro ao persistir:', e.message);
+    }
+  }, 2000);
+}
 
 // ============================================
 // CAPTURA ERROS — evita crash do processo
@@ -67,13 +99,36 @@ function saveJidFromMessage(msgKey) {
     // Salva: número limpo → jid @lid (é o que o WhatsApp espera agora)
     jidMap.set(phone, remoteJid);
     logger.info(`[JID] Mapeado ${phone} → ${remoteJid} (LID)`);
+    persistJidMap();
   } else if (remoteJid.endsWith('@s.whatsapp.net')) {
     // Sistema antigo: salva o número → jid normal
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
     // Só salva se ainda não temos mapeamento LID para esse número
     if (!jidMap.has(phone)) {
       jidMap.set(phone, remoteJid);
+      persistJidMap();
     }
+  }
+}
+
+// Helper genérico: registra par lid <-> telefone vindo de qualquer fonte
+// (contatos, histórico, ou campos extras da própria mensagem)
+function registerLidPhonePair(lidLike, phoneLike, origin) {
+  try {
+    if (!lidLike || !phoneLike) return;
+    const lidStr = String(lidLike);
+    const phoneStr = String(phoneLike);
+    const lidJid = lidStr.includes('@lid') ? lidStr : `${lidStr.replace(/\D/g, '')}@lid`;
+    const phone = phoneStr.replace('@s.whatsapp.net', '').replace(/\D/g, '');
+    if (!phone) return;
+    const already = jidMap.get(phone);
+    if (already !== lidJid) {
+      jidMap.set(phone, lidJid);
+      logger.info(`[MAP:${origin}] ${phone} → ${lidJid}`);
+      persistJidMap();
+    }
+  } catch (e) {
+    logger.warn(`registerLidPhonePair erro: ${e.message}`);
   }
 }
 
@@ -112,6 +167,32 @@ function registerLidPhonePair(lidLike, phoneLike, origin) {
 // ============================================
 // AUTH
 // ============================================
+// ============================================
+// Envia o jidMap completo para o CRM processar
+// as conversas que ficaram presas ao @lid
+// ============================================
+const LID_MAP_WEBHOOK_URL = process.env.LID_MAP_WEBHOOK_URL || WEBHOOK_URL;
+
+async function pushLidMapToCrm(sessionId) {
+  if (!LID_MAP_WEBHOOK_URL || jidMap.size === 0) return;
+  try {
+    const entries = Object.fromEntries(jidMap);
+    const res = await fetch(LID_MAP_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        event: 'lid-map-sync',
+        sessionId,
+        instanceId: sessionId,
+        map: entries,
+      }),
+    });
+    logger.info(`[${sessionId}] [LID-MAP] Enviado ${Object.keys(entries).length} vínculos ao CRM (status ${res.status})`);
+  } catch (e) {
+    logger.warn(`[${sessionId}] [LID-MAP] Falha ao enviar mapa: ${e.message}`);
+  }
+}
+
 const authenticate = (req, res, next) => {
   const apiKey = req.headers['x-api-key'];
   if (apiKey !== API_KEY) {
@@ -276,6 +357,10 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         status: 'connected', connected: true,
         phone: { number: sessionData.phoneNumber }
       });
+
+      // Envia o mapa de LIDs conhecidos ao CRM assim que conecta,
+      // para reprocessar conversas presas sem esperar nova mensagem
+      pushLidMapToCrm(sessionId);
     }
 
     if (connection === 'close') {
@@ -318,6 +403,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const contact of contacts) {
       if (contact.id && contact.id.endsWith('@s.whatsapp.net') && contact.lid) {
+        // direção: telefone → lid (o que o WhatsApp espera para enviar)
         registerLidPhonePair(contact.lid, contact.id, 'contacts.upsert');
       }
     }
@@ -369,6 +455,14 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       // Só para mensagens recebidas — igual à versão original
       if (!isFromMe) {
         saveJidFromMessage(msg.key);
+
+        // Fontes extras de aprendizado, quando presentes na própria mensagem
+        if (msg.key.senderLid && msg.key.senderPn) {
+          registerLidPhonePair(msg.key.senderLid, msg.key.senderPn, 'msg.senderLid');
+        }
+        if (msg.key.participantPn && remoteJid.endsWith('@lid')) {
+          registerLidPhonePair(remoteJid, msg.key.participantPn, 'msg.participantPn');
+        }
       }
 
       const messageType = Object.keys(msg.message)[0];
@@ -397,7 +491,18 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
       }
 
-      // Payload IDÊNTICO ao original — msg.key puro, sem modificação
+      // key permanece IDÊNTICA ao original (msg.key puro).
+      // O telefone resolvido vai como campo ADICIONAL, fora da key,
+      // para o CRM usar sem depender de reprocessar o remoteJid.
+      let resolvedPhoneForWebhook = null;
+      if (remoteJid.endsWith('@lid')) {
+        for (const [phone, jid] of jidMap.entries()) {
+          if (jid === remoteJid) { resolvedPhoneForWebhook = phone; break; }
+        }
+      } else if (remoteJid.endsWith('@s.whatsapp.net')) {
+        resolvedPhoneForWebhook = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
+      }
+
       await sendWebhook({
         event: 'received-message',
         sessionId,
@@ -410,6 +515,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           fromMe: isFromMe,
           audioBase64,
           audioMimetype,
+          resolvedPhone: resolvedPhoneForWebhook,
         }
       });
     }
@@ -666,6 +772,40 @@ async function handleResolveLid(req, res) {
 app.get('/resolve-lid', handleResolveLid);
 app.post('/resolve-lid', handleResolveLid);
 
+// ============================================
+// GET /lid-map — CRM consulta o mapa completo
+// (sincronização sob demanda)
+// ============================================
+app.get('/lid-map', (req, res) => {
+  const entries = Object.fromEntries(jidMap);
+  res.json({ success: true, count: Object.keys(entries).length, map: entries });
+});
+
+// ============================================
+// POST /resolve-lid — resolve em lote
+// Body: { lids: ["123", "456@lid", ...] }
+// ============================================
+app.post('/resolve-lid', (req, res) => {
+  const { lids, lid } = req.body || {};
+  const list = Array.isArray(lids) ? lids : (lid ? [lid] : []);
+  if (list.length === 0) {
+    return res.status(400).json({ error: 'lids (array) ou lid é obrigatório' });
+  }
+
+  const results = {};
+  for (const raw of list) {
+    const cleaned = String(raw).replace('@lid', '').replace(/\D/g, '');
+    // Procura no jidMap por qualquer par onde o LID bate
+    let found = null;
+    for (const [phone, jid] of jidMap.entries()) {
+      if (jid.includes(cleaned)) { found = phone; break; }
+    }
+    results[raw] = found ? { phone: found, jid: jidMap.get(found) } : null;
+  }
+
+  res.json({ success: true, results });
+});
+
 app.get('/status', (req, res) => {
   const allSessions = {};
   sessions.forEach((data, sid) => {
@@ -673,6 +813,8 @@ app.get('/status', (req, res) => {
   });
   res.json({ success: true, uptime: process.uptime(), totalSessions: sessions.size, knownContacts: jidMap.size, sessions: allSessions });
 });
+
+loadJidMapFromDisk();
 
 app.listen(PORT, () => {
   logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
