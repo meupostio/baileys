@@ -15,15 +15,12 @@ const P = require('pino');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
-
 const app = express();
 app.use(express.json());
-
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-
 const sessions = new Map();
 const jidMap = new Map();
 
@@ -33,7 +30,6 @@ function saveJidFromMessage(remoteJid, senderPn) {
   if (remoteJid === 'status@broadcast') return;
   if (remoteJid.endsWith('@newsletter')) return;
   if (remoteJid.endsWith('@broadcast')) return;
-
   if (remoteJid.endsWith('@lid') && senderPn) {
     const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
     const jidToUse = senderPn.includes('@') ? senderPn : `${phone}@s.whatsapp.net`;
@@ -43,7 +39,6 @@ function saveJidFromMessage(remoteJid, senderPn) {
     const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
     if (!jidMap.has(phone)) jidMap.set(phone, remoteJid);
   }
-
   logger.info(`[JID] jidMap atual: ${JSON.stringify([...jidMap.entries()])}`);
 }
 
@@ -75,7 +70,6 @@ const authenticate = (req, res, next) => {
   }
   next();
 };
-
 app.use(authenticate);
 
 async function sendWebhook(payload, retries = 3) {
@@ -147,12 +141,10 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     }
     await cleanupSession(sessionId);
   }
-
   sessionData.reconnectAttempts = 0;
   const authDir = path.join(__dirname, 'auth_info', sessionId);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   sessionData.authState = { state, saveCreds };
-
   const { version } = await fetchLatestBaileysVersion();
   logger.info(`[${sessionId}] Criando socket WhatsApp (versão ${version.join('.')})`);
   
@@ -164,19 +156,16 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     browser: ['Baileys Server', 'Chrome', '121.0.0'],
     syncFullHistory: false
   });
-
   sessionData.sock = sock;
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
       sessionData.qrCodeData = qr;
       sessionData.qrExpiry = Date.now() + 60000;
       sessionData.connectionStatus = 'qr_ready';
       logger.info(`[${sessionId}] 📱 QR Code disponível`);
     }
-
     if (connection === 'open') {
       sessionData.connectionStatus = 'connected';
       sessionData.phoneNumber = sock.user?.id?.split(':')[0] || null;
@@ -190,7 +179,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         phone: { number: sessionData.phoneNumber }
       });
     }
-
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
@@ -222,9 +210,7 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       if (!msg.message) continue;
-
       const remoteJid = msg.key.remoteJid || '';
-
       // ✅ IGNORA grupos, newsletters, broadcasts e status
       if (
         remoteJid.endsWith('@g.us') ||
@@ -235,26 +221,20 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         logger.info(`[${sessionId}] ⏭️ Ignorado: ${remoteJid}`);
         continue;
       }
-
       const isFromMe = msg.key.fromMe === true;
       const senderPn = msg.key.senderPn || msg.key.participant || '';
-
       logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
-
       // Salva mapeamento JID apenas para mensagens recebidas
       if (!isFromMe) {
         saveJidFromMessage(remoteJid, senderPn);
       }
-
       const msgType = Object.keys(msg.message)[0];
       let content = '';
-
       if (msgType === 'conversation') {
         content = msg.message.conversation;
       } else if (msgType === 'extendedTextMessage') {
         content = msg.message.extendedTextMessage?.text || '';
       }
-
       logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} Mensagem ${isFromMe ? 'enviada' : 'recebida'} ${remoteJid}: ${content}`);
 
       // ============================================
@@ -262,7 +242,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       // ============================================
       let audioBase64 = null;
       let audioMimetype = null;
-
       if (msg.message.audioMessage) {
         try {
           logger.info(`[${sessionId}] 🎤 Baixando áudio...`);
@@ -303,7 +282,6 @@ async function createWhatsAppConnection(sessionId, options = {}) {
 // ============================================
 // ENDPOINTS
 // ============================================
-
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', uptime: process.uptime(), sessions: sessions.size, knownContacts: jidMap.size });
 });
@@ -375,6 +353,9 @@ app.delete('/session/:sessionId?', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// ============================================
+// SEND MESSAGE — CORRIGIDO (sync multi-device)
+// ============================================
 app.post('/send-message', async (req, res) => {
   try {
     const { sessionId, phone, message } = req.body;
@@ -384,11 +365,29 @@ app.post('/send-message', async (req, res) => {
     if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
+    const sock = sessionData.sock;
     const jid = resolveJid(phone);
     logger.info(`[${sid}] 📤 Enviando para jid=${jid} (phone=${phone})`);
-    await sessionData.sock.sendMessage(jid, { text: message });
-    logger.info(`[${sid}] ✅ Texto enviado para ${jid}`);
-    res.json({ success: true, jid });
+
+    // Gera mensagem com ID único e userJid do remetente
+    // Isso garante o fanout para os próprios dispositivos (multi-device sync)
+    // e elimina o "Aguardando mensagem" no celular
+    const fullMsg = generateWAMessageFromContent(
+      jid,
+      { conversation: message },
+      {
+        userJid: sock.user.id,
+        timestamp: new Date(),
+      }
+    );
+
+    // relayMessage faz o sync correto com todos os dispositivos vinculados
+    await sock.relayMessage(jid, fullMsg.message, {
+      messageId: fullMsg.key.id,
+    });
+
+    logger.info(`[${sid}] ✅ Mensagem enviada e sincronizada para ${jid} (id: ${fullMsg.key.id})`);
+    res.json({ success: true, jid, messageId: fullMsg.key.id });
   } catch (error) {
     logger.error(`Erro /send-message:`, error);
     res.status(500).json({ error: error.message });
