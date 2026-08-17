@@ -1,22 +1,15 @@
 {
-  "name": "baileys-whatsapp-server",
+  "name": "baileys-whatsapp-api",
   "version": "1.0.0",
-  "description": "Servidor Baileys Multi-User para WhatsApp",
-  "main": "serve.js",
-  "type": "commonjs",
+  "description": "Baileys WhatsApp API for Lovable integration",
+  "main": "server.js",
   "scripts": {
-    "start": "node serve.js",
-    "dev": "node serve.js"
-  },
-  "engines": {
-    "node": ">=18"
+    "start": "node server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.18",
-    "express": "^4.21.2",
-    "pino": "^9.6.0",
-    "pino-pretty": "^13.0.0",
-    "qrcode": "^1.5.4",
-    "@hapi/boom": "^10.0.1"
+    "@whiskeysockets/baileys": "^6.7.7",
+    "express": "^4.18.2",
+    "qrcode": "^1.5.3",
+    "pino": "^8.19.0"
   }
 }
