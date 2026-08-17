@@ -431,6 +431,37 @@ async function createWhatsAppConnection(sessionId, options = {}) {
     }
   });
 
+  // Listeners adicionais — seguros mesmo se não existirem nesta
+  // versão do Baileys (EventEmitter simplesmente não dispara).
+  try {
+    sock.ev.on('contacts.set', (c) => {
+      const list = Array.isArray(c) ? c : (c?.contacts || []);
+      let count = 0;
+      for (const contact of list) {
+        if (contact?.id && contact?.lid) {
+          registerLidPhonePair(contact.lid, contact.id, 'contacts.set');
+          count++;
+        }
+      }
+      if (count > 0) logger.info(`[${sessionId}] [CONTACTS.SET] ${count} mapeados`);
+    });
+  } catch (e) {
+    logger.warn(`[${sessionId}] contacts.set não disponível: ${e.message}`);
+  }
+
+  try {
+    sock.ev.on('lid-mapping.update', (m) => {
+      const entries = Array.isArray(m) ? m : (m ? [m] : []);
+      for (const entry of entries) {
+        if (entry?.lid && entry?.pn) {
+          registerLidPhonePair(entry.lid, entry.pn, 'lid-mapping.update');
+        }
+      }
+    });
+  } catch (e) {
+    logger.warn(`[${sessionId}] lid-mapping.update não disponível: ${e.message}`);
+  }
+
   // ============================================
   // MESSAGES UPSERT
   // ============================================
@@ -462,6 +493,32 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         }
         if (msg.key.participantPn && remoteJid.endsWith('@lid')) {
           registerLidPhonePair(remoteJid, msg.key.participantPn, 'msg.participantPn');
+        }
+
+        // Se ainda não temos esse LID mapeado, consulta o repositório
+        // interno do Baileys (populado por sync/decrypt). Log explícito
+        // do resultado — sem isso ficamos adivinhando.
+        if (remoteJid.endsWith('@lid')) {
+          const lidClean = remoteJid.split('@')[0];
+          const known = [...jidMap.values()].includes(remoteJid);
+          if (!known) {
+            try {
+              const lidMapping = sock.signalRepository?.lidMapping;
+              if (lidMapping?.getPNForLID) {
+                const pn = await lidMapping.getPNForLID(remoteJid);
+                if (pn) {
+                  registerLidPhonePair(remoteJid, pn, 'signalRepository');
+                  logger.info(`[${sessionId}] [SIGNAL-REPO] ${lidClean} → ${pn}`);
+                } else {
+                  logger.info(`[${sessionId}] [SIGNAL-REPO] ${lidClean} → sem resultado (pn vazio)`);
+                }
+              } else {
+                logger.info(`[${sessionId}] [SIGNAL-REPO] lidMapping.getPNForLID indisponível nesta versão`);
+              }
+            } catch (e) {
+              logger.warn(`[${sessionId}] [SIGNAL-REPO] erro ao consultar ${lidClean}: ${e.message}`);
+            }
+          }
         }
       }
 
