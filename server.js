@@ -1,527 +1,289 @@
-// ============================================
-// SERVIDOR BAILEYS MULTI-USUÁRIO
-// ============================================
-const { 
-  makeWASocket, 
-  DisconnectReason, 
-  useMultiFileAuthState, 
+/**
+ * Baileys multi-sessão + resolução de @lid -> número real
+ * Env: PORT, API_KEY, WEBHOOK_URL, AUTH_DIR
+ */
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+const P = require("pino");
+const QRCode = require("qrcode");
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  DisconnectReason,
   fetchLatestBaileysVersion,
-  generateWAMessageFromContent,
-  downloadMediaMessage,
-  proto
-} = require('@whiskeysockets/baileys');
-const express = require('express');
-const P = require('pino');
-const fs = require('fs');
-const path = require('path');
-const QRCode = require('qrcode');
-const app = express();
-app.use(express.json());
+} = require("@whiskeysockets/baileys");
+
 const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY || 'your-secret-key-here';
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-const sessions = new Map();
-const jidMap = new Map();
+const API_KEY = process.env.API_KEY || "";
+const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
+const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, "auth_info");
 
-function saveJidFromMessage(remoteJid, senderPn) {
-  if (!remoteJid) return;
-  if (remoteJid.endsWith('@g.us')) return;
-  if (remoteJid === 'status@broadcast') return;
-  if (remoteJid.endsWith('@newsletter')) return;
-  if (remoteJid.endsWith('@broadcast')) return;
-  if (remoteJid.endsWith('@lid') && senderPn) {
-    const phone = senderPn.replace(/\D/g, '').split('@')[0].split(':')[0];
-    const jidToUse = senderPn.includes('@') ? senderPn : `${phone}@s.whatsapp.net`;
-    jidMap.set(phone, jidToUse);
-    logger.info(`[JID] Mapeado ${phone} → ${jidToUse} (via senderPn)`);
-  } else if (remoteJid.endsWith('@s.whatsapp.net')) {
-    const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    if (!jidMap.has(phone)) jidMap.set(phone, remoteJid);
-  }
-  logger.info(`[JID] jidMap atual: ${JSON.stringify([...jidMap.entries()])}`);
-}
+const app = express();
+app.use(express.json({ limit: "10mb" }));
+const logger = P({ level: "info" });
 
-function resolveJid(phone) {
-  if (!phone) return null;
-  const cleaned = phone.replace(/\D/g, '').split('@')[0].split(':')[0];
-  if (jidMap.has(cleaned)) {
-    const resolved = jidMap.get(cleaned);
-    logger.info(`[JID] Resolvido ${cleaned} → ${resolved}`);
-    return resolved;
-  }
-  if (phone.includes('@g.us')) return `${cleaned}@g.us`;
-  return `${cleaned}@s.whatsapp.net`;
-}
-
-const logger = P({ 
-  level: LOG_LEVEL,
-  transport: {
-    target: 'pino-pretty',
-    options: { colorize: true, translateTime: 'SYS:standard', ignore: 'pid,hostname' }
-  }
+app.use((req, res, next) => {
+  if (req.path === "/") return next();
+  if (!API_KEY) return next();
+  if (req.headers["x-api-key"] !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
+  next();
 });
 
-const authenticate = (req, res, next) => {
-  const apiKey = req.headers['x-api-key'];
-  if (apiKey !== API_KEY) {
-    logger.warn(`[AUTH] Tentativa de acesso não autorizado`);
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-};
-app.use(authenticate);
+/** sessionId -> { sock, status, qr, phone, lidMap: Map, saveTimer } */
+const sessions = new Map();
+const onlyDigits = (v) => String(v || "").split("@")[0].replace(/[^0-9]/g, "");
+const lidFilePath = (id) => path.join(AUTH_DIR, id, "lid-map.json");
 
-async function sendWebhook(payload, retries = 3) {
-  if (!WEBHOOK_URL) return;
-  console.log("Payload: ", payload);
-  for (let i = 0; i < retries; i++) {
+function loadLidMap(sessionId) {
+  try {
+    return new Map(Object.entries(JSON.parse(fs.readFileSync(lidFilePath(sessionId), "utf8"))));
+  } catch { return new Map(); }
+}
+
+function scheduleSaveLidMap(sessionId) {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  clearTimeout(s.saveTimer);
+  s.saveTimer = setTimeout(() => {
     try {
-      const response = await fetch(WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-      if (response.ok) {
-        logger.info(`[WEBHOOK] Enviado com sucesso: ${payload.event}`);
-        return;
+      fs.mkdirSync(path.dirname(lidFilePath(sessionId)), { recursive: true });
+      fs.writeFileSync(lidFilePath(sessionId), JSON.stringify(Object.fromEntries(s.lidMap)));
+    } catch (e) { logger.warn({ e: e.message }, "[lid] save failed"); }
+  }, 1500);
+}
+
+/** guarda o par lid -> telefone (descarta os 15 dígitos do @lid) */
+function learnLid(sessionId, lidRaw, phoneRaw) {
+  const lid = onlyDigits(lidRaw);
+  const phone = onlyDigits(phoneRaw);
+  if (!lid || !phone || lid === phone) return;
+  if (phone.length < 10 || phone.length > 14) return;
+  const s = sessions.get(sessionId);
+  if (!s || s.lidMap.get(lid) === phone) return;
+  s.lidMap.set(lid, phone);
+  scheduleSaveLidMap(sessionId);
+  logger.info({ sessionId, lid, phone }, "[lid] learned");
+  postWebhook({ event: "lid-map", sessionId, entries: [{ lid, phone }] });
+}
+
+/** cache -> Baileys lidMapping -> store de contatos */
+async function resolveLid(sessionId, lidRaw) {
+  const lid = onlyDigits(lidRaw);
+  const s = sessions.get(sessionId);
+  if (!lid || !s) return null;
+
+  const cached = s.lidMap.get(lid);
+  if (cached) return cached;
+
+  try {
+    const mapping = s.sock?.signalRepository?.lidMapping;
+    if (mapping?.getPNForLID) {
+      const digits = onlyDigits(await mapping.getPNForLID(`${lid}@lid`));
+      if (digits) { learnLid(sessionId, lid, digits); return digits; }
+    }
+  } catch (e) { logger.warn({ e: e.message }, "[lid] getPNForLID failed"); }
+
+  try {
+    for (const [jid, c] of Object.entries(s.sock?.store?.contacts || {})) {
+      if (onlyDigits(jid) === lid || onlyDigits(c?.lid) === lid) {
+        const digits = onlyDigits(c?.id || c?.jid || jid);
+        if (digits && digits.length <= 14) { learnLid(sessionId, lid, digits); return digits; }
       }
-      logger.warn(`[WEBHOOK] Falha (${response.status}), tentativa ${i + 1}/${retries}`);
-    } catch (e) {
-      logger.error(`[WEBHOOK] Erro na tentativa ${i + 1}/${retries}:`, e.message);
-      if (i < retries - 1) await new Promise(resolve => setTimeout(resolve, 2000));
     }
-  }
-  logger.error(`[WEBHOOK] Falhou após ${retries} tentativas`);
+  } catch {}
+  return null;
 }
 
-async function getOrCreateSession(sessionId) {
-  if (!sessionId) sessionId = 'default';
-  if (sessions.has(sessionId)) return sessions.get(sessionId);
-  const sessionData = {
-    sock: null, qrCodeData: null, qrExpiry: null,
-    connectionStatus: 'disconnected', authState: null,
-    phoneNumber: null, reconnectAttempts: 0
-  };
-  const authDir = path.join(__dirname, 'auth_info', sessionId);
-  if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
-  sessions.set(sessionId, sessionData);
-  logger.info(`[${sessionId}] Nova sessão criada`);
-  return sessionData;
+async function postWebhook(body) {
+  if (!WEBHOOK_URL) return;
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (e) { logger.warn({ e: e.message }, "[webhook] failed"); }
 }
 
-async function cleanupSession(sessionId) {
-  const sessionData = sessions.get(sessionId);
-  if (!sessionData) return;
-  logger.info(`[${sessionId}] Iniciando cleanup...`);
-  if (sessionData.sock) {
-    try {
-      if (sessionData.sock.user) await sessionData.sock.logout();
-    } catch (e) {
-      logger.warn(`[${sessionId}] Erro logout: ${e.message}`);
-    }
-    sessionData.sock = null;
-  }
-  sessionData.qrCodeData = null;
-  sessionData.qrExpiry = null;
-  sessionData.connectionStatus = 'disconnected';
-  sessionData.phoneNumber = null;
-  sessionData.reconnectAttempts = 0;
-  logger.info(`[${sessionId}] Cleanup concluído`);
-}
+async function startSession(sessionId) {
+  let s = sessions.get(sessionId);
+  if (s?.sock && s.status === "connected") return s;
 
-async function createWhatsAppConnection(sessionId, options = {}) {
-  const sessionData = await getOrCreateSession(sessionId);
-  
-  if (sessionData.sock) {
-    const isConnected = sessionData.sock.user && sessionData.connectionStatus === 'connected';
-    if (isConnected) {
-      logger.info(`[${sessionId}] ✅ Socket já conectado: ${sessionData.phoneNumber}`);
-      return sessionData;
-    }
-    await cleanupSession(sessionId);
-  }
-  sessionData.reconnectAttempts = 0;
-  const authDir = path.join(__dirname, 'auth_info', sessionId);
-  const { state, saveCreds } = await useMultiFileAuthState(authDir);
-  sessionData.authState = { state, saveCreds };
+  const dir = path.join(AUTH_DIR, sessionId);
+  fs.mkdirSync(dir, { recursive: true });
+  const { state, saveCreds } = await useMultiFileAuthState(dir);
   const { version } = await fetchLatestBaileysVersion();
-  logger.info(`[${sessionId}] Criando socket WhatsApp (versão ${version.join('.')})`);
-  
+
   const sock = makeWASocket({
     version,
     auth: state,
-    printQRInTerminal: options.printQR !== false,
-    logger: P({ level: 'warn' }),
-    browser: ['Baileys Server', 'Chrome', '121.0.0'],
-    syncFullHistory: false
+    printQRInTerminal: false,
+    logger: P({ level: "silent" }),
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
   });
-  sessionData.sock = sock;
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
+  s = s || { lidMap: loadLidMap(sessionId) };
+  s.sock = sock; s.status = "connecting"; s.qr = null;
+  sessions.set(sessionId, s);
+
+  sock.ev.on("creds.update", saveCreds);
+
+  sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      sessionData.qrCodeData = qr;
-      sessionData.qrExpiry = Date.now() + 60000;
-      sessionData.connectionStatus = 'qr_ready';
-      logger.info(`[${sessionId}] 📱 QR Code disponível`);
+      s.qr = await QRCode.toDataURL(qr);
+      s.status = "qr";
+      postWebhook({ event: "status-updated", sessionId, status: "qr_ready", qrcode: s.qr });
     }
-    if (connection === 'open') {
-      sessionData.connectionStatus = 'connected';
-      sessionData.phoneNumber = sock.user?.id?.split(':')[0] || null;
-      sessionData.qrCodeData = null;
-      sessionData.qrExpiry = null;
-      sessionData.reconnectAttempts = 0;
-      logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
-      await sendWebhook({
-        event: 'status-updated', sessionId,
-        status: 'connected', connected: true,
-        phone: { number: sessionData.phoneNumber }
-      });
+    if (connection === "open") {
+      s.status = "connected"; s.qr = null; s.phone = onlyDigits(sock.user?.id);
+      if (sock.user?.lid) learnLid(sessionId, sock.user.lid, s.phone);
+      postWebhook({ event: "status-updated", sessionId, status: "connected", phone: s.phone });
+      const entries = [...s.lidMap].map(([lid, phone]) => ({ lid, phone }));
+      if (entries.length) postWebhook({ event: "lid-map", sessionId, entries });
     }
-    if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      logger.warn(`[${sessionId}] ❌ Conexão fechada (código: ${statusCode})`);
-      sessionData.connectionStatus = 'disconnected';
-      sessionData.qrCodeData = null;
-      sessionData.qrExpiry = null;
-      sessionData.phoneNumber = null;
-      await sendWebhook({
-        event: 'status-updated', sessionId,
-        status: 'disconnected', connected: false
-      });
-      if (shouldReconnect && sessionData.reconnectAttempts < 3) {
-        sessionData.reconnectAttempts++;
-        const delay = 5000 * sessionData.reconnectAttempts;
-        logger.info(`[${sessionId}] Reconectando ${sessionData.reconnectAttempts}/3 em ${delay}ms`);
-        setTimeout(() => createWhatsAppConnection(sessionId, options), delay);
-      } else if (sessionData.reconnectAttempts >= 3) {
-        logger.error(`[${sessionId}] Limite de reconexões atingido`);
-      }
+    if (connection === "close") {
+      const loggedOut = lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut;
+      s.status = loggedOut ? "logged_out" : "disconnected";
+      postWebhook({ event: "status-updated", sessionId, status: s.status });
+      if (!loggedOut) setTimeout(() => startSession(sessionId).catch(() => {}), 4000);
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  const learnFromContacts = (list) => {
+    for (const c of list || []) if (c?.lid && c?.id) learnLid(sessionId, c.lid, c.id);
+  };
+  sock.ev.on("contacts.upsert", learnFromContacts);
+  sock.ev.on("contacts.set", (d) => learnFromContacts(d?.contacts));
+  sock.ev.on("lid-mapping.update", (m) => {
+    for (const [lid, pn] of Object.entries(m || {})) learnLid(sessionId, lid, pn);
+  });
 
-  // ============================================
-  // EVENT: messages.upsert
-  // ============================================
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
     for (const msg of messages) {
-      if (!msg.message) continue;
-      const remoteJid = msg.key.remoteJid || '';
-      // ✅ IGNORA grupos, newsletters, broadcasts e status
-      if (
-        remoteJid.endsWith('@g.us') ||
-        remoteJid.endsWith('@newsletter') ||
-        remoteJid.endsWith('@broadcast') ||
-        remoteJid === 'status@broadcast'
-      ) {
-        logger.info(`[${sessionId}] ⏭️ Ignorado: ${remoteJid}`);
-        continue;
-      }
-      const isFromMe = msg.key.fromMe === true;
-      const senderPn = msg.key.senderPn || msg.key.participant || '';
-      logger.info(`[${sessionId}] 🔍 remoteJid=${remoteJid} senderPn=${senderPn} fromMe=${isFromMe}`);
-      // Salva mapeamento JID apenas para mensagens recebidas
-      if (!isFromMe) {
-        saveJidFromMessage(remoteJid, senderPn);
-      }
-      const msgType = Object.keys(msg.message)[0];
-      let content = '';
-      if (msgType === 'conversation') {
-        content = msg.message.conversation;
-      } else if (msgType === 'extendedTextMessage') {
-        content = msg.message.extendedTextMessage?.text || '';
-      }
-      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} Mensagem ${isFromMe ? 'enviada' : 'recebida'} ${remoteJid}: ${content}`);
+      const key = msg.key || {};
+      const remoteJid = key.remoteJid || "";
+      if (remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") continue;
 
-      // ============================================
-      // DOWNLOAD DE ÁUDIO
-      // ============================================
-      let audioBase64 = null;
-      let audioMimetype = null;
-      if (msg.message.audioMessage) {
-        try {
-          logger.info(`[${sessionId}] 🎤 Baixando áudio...`);
-          const buffer = await downloadMediaMessage(
-            msg,
-            'buffer',
-            {},
-            { logger, reuploadRequest: sock.updateMediaMessage }
-          );
-          audioBase64 = buffer.toString('base64');
-          audioMimetype = msg.message.audioMessage.mimetype || 'audio/ogg; codecs=opus';
-          logger.info(`[${sessionId}] ✅ Áudio baixado (${buffer.length} bytes)`);
-        } catch (e) {
-          logger.error(`[${sessionId}] ❌ Erro ao baixar áudio: ${e.message}`);
-        }
-      }
+      const lidCand = [remoteJid, key.participant, key.senderLid]
+        .find((j) => String(j || "").endsWith("@lid"));
+      const pnCand = [key.senderPn, key.remoteJidAlt, key.participantPn]
+        .find((j) => String(j || "").endsWith("@s.whatsapp.net"));
+      if (lidCand && pnCand) learnLid(sessionId, lidCand, pnCand);
 
-      await sendWebhook({
-        event: 'received-message',
+      let phone = onlyDigits(pnCand || (remoteJid.endsWith("@lid") ? "" : remoteJid));
+      if (!phone && lidCand) phone = (await resolveLid(sessionId, lidCand)) || "";
+
+      postWebhook({
+        event: key.fromMe ? "message-sent" : "message-received",
         sessionId,
-        instanceId: sessionId,
+        messageId: key.id,
         data: {
-          key: msg.key,
+          key,
           message: msg.message,
-          messageTimestamp: msg.messageTimestamp,
           pushName: msg.pushName,
-          fromMe: isFromMe,
-          audioBase64,
-          audioMimetype,
-        }
+          fromMe: !!key.fromMe,
+          messageTimestamp: msg.messageTimestamp,
+          senderPn: key.senderPn || null,
+          remoteJidAlt: key.remoteJidAlt || null,
+          participantPn: key.participantPn || null,
+          lid: lidCand ? onlyDigits(lidCand) : null,
+          phone: phone || null,
+        },
       });
     }
   });
 
-  return sessionData;
+  return s;
 }
 
-// ============================================
-// ENDPOINTS
-// ============================================
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), sessions: sessions.size, knownContacts: jidMap.size });
+/* ------------------------------ rotas ------------------------------ */
+
+app.get("/health", (_req, res) => {
+  let known = 0;
+  for (const s of sessions.values()) known += s.lidMap?.size || 0;
+  res.json({ status: "ok", uptime: process.uptime(), sessions: sessions.size, knownContacts: known });
 });
 
-app.post('/create-session', async (req, res) => {
+app.post("/create-session", async (req, res) => {
+  const sessionId = req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
   try {
-    const { sessionId, printQR } = req.body;
-    const sid = sessionId || 'default';
-    const sessionData = await createWhatsAppConnection(sid, { printQR });
-    await new Promise(r => setTimeout(r, 3000));
-    if (sessionData.connectionStatus === 'connected') {
-      return res.json({ success: true, status: 'connected', phone: sessionData.phoneNumber });
+    const s = await startSession(sessionId);
+    res.json({ sessionId, status: s.status, qrcode: s.qr || null, phone: s.phone || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/qrcode", (req, res) => {
+  const s = sessions.get(req.query.sessionId);
+  if (!s) return res.status(404).json({ error: "session not found" });
+  res.json({ sessionId: req.query.sessionId, status: s.status, qrcode: s.qr || null, phone: s.phone || null });
+});
+
+app.post("/logout", async (req, res) => {
+  const s = sessions.get(req.body?.sessionId);
+  try { await s?.sock?.logout(); } catch {}
+  res.json({ success: true });
+});
+
+app.delete("/session/:id", async (req, res) => {
+  const sessionId = req.params.id;
+  const s = sessions.get(sessionId);
+  try { await s?.sock?.logout(); } catch {}
+  try { s?.sock?.end?.(); } catch {}
+  sessions.delete(sessionId);
+  try { fs.rmSync(path.join(AUTH_DIR, sessionId), { recursive: true, force: true }); } catch {}
+  const exists = fs.existsSync(path.join(AUTH_DIR, sessionId));
+  res.json({ success: !exists, deleted: !exists, exists });
+});
+
+app.post("/send-message", async (req, res) => {
+  const { sessionId, phone, jid, message } = req.body || {};
+  const s = sessions.get(sessionId);
+  if (!s?.sock || s.status !== "connected") return res.status(409).json({ error: "session not connected" });
+  let target = jid || phone || "";
+  if (!String(target).includes("@")) target = `${onlyDigits(target)}@s.whatsapp.net`;
+  try {
+    const sent = await s.sock.sendMessage(target, { text: String(message ?? "") });
+    res.json({ success: true, messageId: sent?.key?.id || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/lid-map", (req, res) => {
+  const s = sessions.get(req.query.sessionId);
+  if (!s) return res.json({ entries: [] });
+  res.json({ entries: [...s.lidMap].map(([lid, phone]) => ({ lid, phone })) });
+});
+
+app.get("/resolve-lid", async (req, res) => {
+  const phone = await resolveLid(req.query.sessionId, req.query.lid);
+  res.json({ phone, jid: phone ? `${phone}@s.whatsapp.net` : null, source: phone ? "resolved" : "not_found" });
+});
+
+app.post("/resolve-lid", async (req, res) => {
+  const { sessionId, lid, lids } = req.body || {};
+  if (Array.isArray(lids)) {
+    const entries = [];
+    for (const l of lids) {
+      const phone = await resolveLid(sessionId, l);
+      if (phone) entries.push({ lid: onlyDigits(l), phone });
     }
-    if (sessionData.qrCodeData) {
-      const qrBase64 = await QRCode.toDataURL(sessionData.qrCodeData);
-      return res.json({ success: true, qrcode: qrBase64, status: sessionData.connectionStatus, expiresIn: 60 });
-    }
-    return res.json({ success: true, status: sessionData.connectionStatus });
-  } catch (error) {
-    logger.error(`Erro /create-session:`, error);
-    res.status(500).json({ error: error.message });
+    return res.json({ entries });
   }
+  const phone = await resolveLid(sessionId, lid);
+  res.json({ phone, jid: phone ? `${phone}@s.whatsapp.net` : null, source: phone ? "resolved" : "not_found" });
 });
 
-app.get('/qrcode', async (req, res) => {
+app.post("/on-whatsapp", async (req, res) => {
+  const { sessionId, phone } = req.body || {};
+  const s = sessions.get(sessionId);
+  if (!s?.sock) return res.json({ exists: false });
   try {
-    const sessionId = req.query.sessionId || 'default';
-    const sessionData = sessions.get(sessionId);
-    if (!sessionData) return res.json({ status: 'disconnected' });
-    if (sessionData.qrCodeData && sessionData.qrExpiry && Date.now() > sessionData.qrExpiry) {
-      sessionData.qrCodeData = null;
-      sessionData.qrExpiry = null;
-    }
-    if (sessionData.connectionStatus === 'connected') {
-      return res.json({ status: 'connected', phone: sessionData.phoneNumber });
-    }
-    if (sessionData.qrCodeData) {
-      const qrBase64 = await QRCode.toDataURL(sessionData.qrCodeData);
-      return res.json({ qrcode: qrBase64, status: sessionData.connectionStatus, expiresIn: Math.max(0, Math.floor((sessionData.qrExpiry - Date.now()) / 1000)) });
-    }
-    return res.json({ status: sessionData.connectionStatus });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+    const r = await s.sock.onWhatsApp(`${onlyDigits(phone)}@s.whatsapp.net`);
+    res.json({ exists: !!r?.[0]?.exists, jid: r?.[0]?.jid || null, lid: r?.[0]?.lid || null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/disconnect', async (req, res) => {
-  try {
-    await cleanupSession(req.body.sessionId || 'default');
-    res.json({ success: true });
-  } catch (error) { res.status(500).json({ error: error.message }); }
-});
-
-app.post('/logout', async (req, res) => {
-  try {
-    await cleanupSession(req.body.sessionId || 'default');
-    res.json({ success: true });
-  } catch (error) { res.status(500).json({ error: error.message }); }
-});
-
-app.delete('/session/:sessionId?', async (req, res) => {
-  try {
-    const sessionId = req.params.sessionId || 'default';
-    await cleanupSession(sessionId);
-    const authDir = path.join(__dirname, 'auth_info', sessionId);
-    if (fs.existsSync(authDir)) fs.rmSync(authDir, { recursive: true, force: true });
-    sessions.delete(sessionId);
-    res.json({ success: true });
-  } catch (error) { res.status(500).json({ error: error.message }); }
-});
-
-// ============================================
-// SEND MESSAGE — CORRIGIDO (sync multi-device)
-// ============================================
-app.post('/send-message', async (req, res) => {
-  try {
-    const { sessionId, phone, message } = req.body;
-    const sid = sessionId || 'default';
-    if (!phone || !message) return res.status(400).json({ error: 'phone e message são obrigatórios' });
-    const sessionData = sessions.get(sid);
-    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
-      return res.status(400).json({ error: 'WhatsApp não conectado' });
-    }
-    const sock = sessionData.sock;
-    const jid = resolveJid(phone);
-    logger.info(`[${sid}] 📤 Enviando para jid=${jid} (phone=${phone})`);
-
-    // Gera mensagem com ID único e userJid do remetente
-    // Isso garante o fanout para os próprios dispositivos (multi-device sync)
-    // e elimina o "Aguardando mensagem" no celular
-    const fullMsg = generateWAMessageFromContent(
-      jid,
-      { conversation: message },
-      {
-        userJid: sock.user.id,
-        timestamp: new Date(),
-      }
-    );
-
-    // relayMessage faz o sync correto com todos os dispositivos vinculados
-    await sock.relayMessage(jid, fullMsg.message, {
-      messageId: fullMsg.key.id,
-    });
-
-    logger.info(`[${sid}] ✅ Mensagem enviada e sincronizada para ${jid} (id: ${fullMsg.key.id})`);
-    res.json({ success: true, jid, messageId: fullMsg.key.id });
-  } catch (error) {
-    logger.error(`Erro /send-message:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/send-buttons', async (req, res) => {
-  try {
-    const { sessionId, phone, text, footer, title, buttons } = req.body;
-    const sid = sessionId || 'default';
-    if (!phone || !text || !buttons || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ error: 'phone, text e buttons são obrigatórios' });
-    }
-    const sessionData = sessions.get(sid);
-    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
-      return res.status(400).json({ error: 'WhatsApp não conectado' });
-    }
-    const jid = resolveJid(phone);
-    const nativeButtons = buttons.map(btn => ({
-      name: 'quick_reply',
-      buttonParamsJson: JSON.stringify({ display_text: btn.text, id: btn.id })
-    }));
-    const interactiveMsg = {
-      interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-        body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
-        footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
-        header: proto.Message.InteractiveMessage.Header.fromObject({ title: title || '', subtitle: '', hasMediaAttachment: false }),
-        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({ buttons: nativeButtons })
-      })
-    };
-    const msg = generateWAMessageFromContent(jid, { viewOnceMessage: { message: interactiveMsg } }, {});
-    await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    logger.info(`[${sid}] 🔘 Botões enviados para ${jid}`);
-    res.json({ success: true, jid, type: 'buttons' });
-  } catch (error) {
-    logger.error(`Erro /send-buttons:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/send-list', async (req, res) => {
-  try {
-    const { sessionId, phone, text, title, buttonText, footer, sections } = req.body;
-    const sid = sessionId || 'default';
-    if (!phone || !text || !sections || !Array.isArray(sections) || sections.length === 0) {
-      return res.status(400).json({ error: 'phone, text e sections são obrigatórios' });
-    }
-    const sessionData = sessions.get(sid);
-    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
-      return res.status(400).json({ error: 'WhatsApp não conectado' });
-    }
-    const jid = resolveJid(phone);
-    const listParams = {
-      title: buttonText || 'Ver opções',
-      sections: sections.map(section => ({
-        title: section.title || '',
-        rows: section.rows.map(row => ({ header: '', title: row.title, description: row.description || '', id: row.id }))
-      }))
-    };
-    const interactiveMsg = {
-      interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-        body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
-        footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
-        header: proto.Message.InteractiveMessage.Header.fromObject({ title: title || '', subtitle: '', hasMediaAttachment: false }),
-        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
-          buttons: [{ name: 'single_select', buttonParamsJson: JSON.stringify(listParams) }]
-        })
-      })
-    };
-    const msg = generateWAMessageFromContent(jid, { viewOnceMessage: { message: interactiveMsg } }, {});
-    await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    logger.info(`[${sid}] 📋 Menu enviado para ${jid}`);
-    res.json({ success: true, jid, type: 'list' });
-  } catch (error) {
-    logger.error(`Erro /send-list:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post('/send-link-button', async (req, res) => {
-  try {
-    const { sessionId, phone, text, footer, title, buttons } = req.body;
-    const sid = sessionId || 'default';
-    if (!phone || !text || !buttons || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ error: 'phone, text e buttons são obrigatórios' });
-    }
-    const sessionData = sessions.get(sid);
-    if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
-      return res.status(400).json({ error: 'WhatsApp não conectado' });
-    }
-    const jid = resolveJid(phone);
-    const nativeButtons = buttons.map(btn => {
-      if (btn.url) return { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: btn.text, url: btn.url, merchant_url: btn.url }) };
-      if (btn.phoneNumber) return { name: 'cta_call', buttonParamsJson: JSON.stringify({ display_text: btn.text, phone_number: btn.phoneNumber }) };
-      return { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: btn.text, id: btn.id || btn.text }) };
-    });
-    const interactiveMsg = {
-      interactiveMessage: proto.Message.InteractiveMessage.fromObject({
-        body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
-        footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
-        header: proto.Message.InteractiveMessage.Header.fromObject({ title: title || '', subtitle: '', hasMediaAttachment: false }),
-        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({ buttons: nativeButtons })
-      })
-    };
-    const msg = generateWAMessageFromContent(jid, { viewOnceMessage: { message: interactiveMsg } }, {});
-    await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    logger.info(`[${sid}] 🔗 Link button enviado para ${jid}`);
-    res.json({ success: true, jid, type: 'link_button' });
-  } catch (error) {
-    logger.error(`Erro /send-link-button:`, error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.get('/status', (req, res) => {
-  const allSessions = {};
-  sessions.forEach((data, sid) => {
-    allSessions[sid] = { status: data.connectionStatus, phone: data.phoneNumber, hasQR: !!data.qrCodeData, reconnectAttempts: data.reconnectAttempts };
-  });
-  res.json({ success: true, uptime: process.uptime(), totalSessions: sessions.size, knownContacts: jidMap.size, sessions: allSessions });
-});
-
-app.listen(PORT, () => {
-  logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
-  logger.info(`🔐 API Key: ${API_KEY ? '✅' : '❌'}`);
-  logger.info(`🪝 Webhook: ${WEBHOOK_URL || 'Não configurado'}`);
-});
-
-process.on('SIGINT', async () => {
-  for (const [sid] of sessions.entries()) await cleanupSession(sid);
-  process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-  for (const [sid] of sessions.entries()) await cleanupSession(sid);
-  process.exit(0);
-});
+app.listen(PORT, () => logger.info(`server on :${PORT}`));
