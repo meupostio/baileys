@@ -1,6 +1,12 @@
 // ============================================
 // SERVIDOR BAILEYS MULTI-USUÁRIO
-// Versão consolidada — apenas mudanças confirmadas
+// ============================================
+// Base: versão original estável (botões via nativeFlow,
+// mesmo método usado por Evolution API / Z-API).
+// Acrescentado apenas: keep-alive (corrige "Aguardando
+// mensagem" em iPhone) e captura de erros não tratados.
+// Nada de LID foi alterado — normalizeJid permanece
+// idêntico ao original.
 // ============================================
 const { 
   makeWASocket, 
@@ -16,51 +22,17 @@ const P = require('pino');
 const fs = require('fs');
 const path = require('path');
 const QRCode = require('qrcode');
-
 const app = express();
 app.use(express.json());
-
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'your-secret-key-here';
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const sessions = new Map();
-const jidMap = new Map(); // phone_limpo -> jid_para_responder
-
-// ============================================
-// PERSISTÊNCIA — sobrevive a restart/hibernação do Render
-// ============================================
-const JIDMAP_FILE = path.join(__dirname, 'auth_info', 'jidmap.json');
-let persistDebounceTimer = null;
-
-function loadJidMapFromDisk() {
-  try {
-    if (fs.existsSync(JIDMAP_FILE)) {
-      const raw = fs.readFileSync(JIDMAP_FILE, 'utf-8');
-      const obj = JSON.parse(raw);
-      for (const [k, v] of Object.entries(obj)) jidMap.set(k, v);
-      console.log(`[JIDMAP] Carregado do disco: ${jidMap.size} entradas`);
-    }
-  } catch (e) {
-    console.error('[JIDMAP] Erro ao carregar:', e.message);
-  }
-}
-
-function persistJidMap() {
-  clearTimeout(persistDebounceTimer);
-  persistDebounceTimer = setTimeout(() => {
-    try {
-      const dir = path.dirname(JIDMAP_FILE);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(JIDMAP_FILE, JSON.stringify(Object.fromEntries(jidMap)), 'utf-8');
-    } catch (e) {
-      console.error('[JIDMAP] Erro ao persistir:', e.message);
-    }
-  }, 2000);
-}
 
 // ============================================
 // CAPTURA ERROS — evita crash do processo
+// (adição de hoje, não mexe em lógica de negócio)
 // ============================================
 process.on('uncaughtException', (err) => {
   console.error('❌ uncaughtException:', err.message, err.stack);
@@ -78,130 +50,32 @@ const logger = P({
 });
 
 // ============================================
-// JID HELPERS — igual à versão original que
-// identificava números corretamente
+// NORMALIZAR JID (corrige contato fantasma)
+// IDÊNTICO ao original — não alterado
 // ============================================
-function saveJidFromMessage(msgKey) {
-  if (!msgKey) return;
-  const remoteJid    = msgKey.remoteJid || '';
-  const remoteJidAlt = msgKey.remoteJidAlt || '';
-
-  // Ignora grupos, newsletters, broadcasts e status
-  if (remoteJid.endsWith('@g.us')) return;
-  if (remoteJid.endsWith('@newsletter')) return;
-  if (remoteJid.endsWith('@broadcast')) return;
-  if (remoteJid === 'status@broadcast') return;
-
-  // Se veio com @lid, temos o JID novo e o número alternativo
-  if (remoteJid.endsWith('@lid') && remoteJidAlt) {
-    // Extrai o número limpo do Alt (número de telefone real)
-    const phone = remoteJidAlt.replace(/\D/g, '').split('@')[0].split(':')[0];
-    // Salva: número limpo → jid @lid (é o que o WhatsApp espera agora)
-    jidMap.set(phone, remoteJid);
-    logger.info(`[JID] Mapeado ${phone} → ${remoteJid} (LID)`);
-    persistJidMap();
-  } else if (remoteJid.endsWith('@s.whatsapp.net')) {
-    // Sistema antigo: salva o número → jid normal
-    const phone = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
-    // Só salva se ainda não temos mapeamento LID para esse número
-    if (!jidMap.has(phone)) {
-      jidMap.set(phone, remoteJid);
-      persistJidMap();
-    }
-  }
-}
-
-// Helper genérico: registra par lid <-> telefone vindo de qualquer fonte
-// (contatos, histórico, ou campos extras da própria mensagem)
-function registerLidPhonePair(lidLike, phoneLike, origin) {
-  try {
-    if (!lidLike || !phoneLike) return;
-    const lidStr = String(lidLike);
-    const phoneStr = String(phoneLike);
-    const lidJid = lidStr.includes('@lid') ? lidStr : `${lidStr.replace(/\D/g, '')}@lid`;
-    const phone = phoneStr.replace('@s.whatsapp.net', '').replace(/\D/g, '');
-    if (!phone) return;
-    const already = jidMap.get(phone);
-    if (already !== lidJid) {
-      jidMap.set(phone, lidJid);
-      logger.info(`[MAP:${origin}] ${phone} → ${lidJid}`);
-      persistJidMap();
-    }
-  } catch (e) {
-    logger.warn(`registerLidPhonePair erro: ${e.message}`);
-  }
-}
-
-function resolveJid(phone) {
+function normalizeJid(phone) {
   if (!phone) return null;
-  const cleaned = phone.replace(/\D/g, '').split('@')[0].split(':')[0];
-  if (jidMap.has(cleaned)) {
-    const resolved = jidMap.get(cleaned);
-    logger.info(`[JID] Resolvido ${cleaned} → ${resolved}`);
-    return resolved;
+  let cleaned = phone.replace(/\D/g, '');
+  cleaned = cleaned.split('@')[0].split(':')[0];
+  
+  if (cleaned.startsWith('55') && cleaned.length === 12) {
+    const ddd = cleaned.substring(2, 4);
+    const number = cleaned.substring(4);
+    cleaned = `55${ddd}9${number}`;
   }
+  
   if (phone.includes('@g.us')) return `${cleaned}@g.us`;
   return `${cleaned}@s.whatsapp.net`;
 }
 
-// Registra par lid<->phone vindo de qualquer fonte (contatos, histórico)
-function registerLidPhonePair(lidLike, phoneLike, origin) {
-  try {
-    if (!lidLike || !phoneLike) return;
-    const lid = String(lidLike).replace('@lid', '').replace(/\D/g, '');
-    const phone = String(phoneLike).replace('@s.whatsapp.net', '').replace(/\D/g, '');
-    if (!lid || !phone) return;
-    const jid = `${phone}@s.whatsapp.net`;
-    const already = jidMap.get(lid);
-    jidMap.set(lid, jid);
-    jidMap.set(phone, jid);
-    if (already !== jid) {
-      logger.info(`[MAP:${origin}] lid=${lid} → ${jid}`);
-    }
-  } catch (e) {
-    logger.warn(`registerLidPhonePair erro: ${e.message}`);
-  }
-}
-
-
 // ============================================
-// AUTH
+// MIDDLEWARE AUTH
 // ============================================
-// ============================================
-// Envia o jidMap completo para o CRM processar
-// as conversas que ficaram presas ao @lid
-// ============================================
-const LID_MAP_WEBHOOK_URL = process.env.LID_MAP_WEBHOOK_URL || WEBHOOK_URL;
-
-async function pushLidMapToCrm(sessionId) {
-  if (!LID_MAP_WEBHOOK_URL || jidMap.size === 0) return;
-  try {
-    const entries = Object.fromEntries(jidMap);
-    const res = await fetch(LID_MAP_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        event: 'lid-map-sync',
-        sessionId,
-        instanceId: sessionId,
-        map: entries,
-      }),
-    });
-    logger.info(`[${sessionId}] [LID-MAP] Enviado ${Object.keys(entries).length} vínculos ao CRM (status ${res.status})`);
-  } catch (e) {
-    logger.warn(`[${sessionId}] [LID-MAP] Falha ao enviar mapa: ${e.message}`);
-  }
-}
-
-const authenticate = (req, res, next) => {
+app.use((req, res, next) => {
   const apiKey = req.headers['x-api-key'];
-  if (apiKey !== API_KEY) {
-    logger.warn(`[AUTH] Tentativa de acesso não autorizado`);
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
+  if (apiKey !== API_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
-};
-app.use(authenticate);
+});
 
 // ============================================
 // WEBHOOK
@@ -210,63 +84,47 @@ async function sendWebhook(payload, retries = 3) {
   if (!WEBHOOK_URL) return;
   for (let i = 0; i < retries; i++) {
     try {
-      const response = await fetch(WEBHOOK_URL, {
+      const r = await fetch(WEBHOOK_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-      if (response.ok) {
-        logger.info(`[WEBHOOK] Enviado com sucesso: ${payload.event}`);
-        return;
-      }
-      logger.warn(`[WEBHOOK] Falha (${response.status}), tentativa ${i + 1}/${retries}`);
+      if (r.ok) { logger.info(`[WEBHOOK] ✅ ${payload.event}`); return; }
     } catch (e) {
-      logger.error(`[WEBHOOK] Erro na tentativa ${i + 1}/${retries}:`, e.message);
-      if (i < retries - 1) await new Promise(resolve => setTimeout(resolve, 2000));
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 2000));
     }
   }
-  logger.error(`[WEBHOOK] Falhou após ${retries} tentativas`);
 }
 
 // ============================================
-// SESSION MANAGEMENT
+// SESSÕES
 // ============================================
 async function getOrCreateSession(sessionId) {
   if (!sessionId) sessionId = 'default';
   if (sessions.has(sessionId)) return sessions.get(sessionId);
   const sessionData = {
-    sock: null,
-    qrCodeData: null,
-    qrExpiry: null,
-    connectionStatus: 'disconnected',
-    authState: null,
-    phoneNumber: null,
-    reconnectAttempts: 0,
+    sock: null, qrCodeData: null, qrExpiry: null,
+    connectionStatus: 'disconnected', authState: null,
+    phoneNumber: null, reconnectAttempts: 0,
     keepAliveInterval: null,
   };
   const authDir = path.join(__dirname, 'auth_info', sessionId);
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
   sessions.set(sessionId, sessionData);
-  logger.info(`[${sessionId}] Nova sessão criada`);
   return sessionData;
 }
 
 async function cleanupSession(sessionId) {
   const sessionData = sessions.get(sessionId);
   if (!sessionData) return;
-  logger.info(`[${sessionId}] Iniciando cleanup...`);
-
   if (sessionData.keepAliveInterval) {
     clearInterval(sessionData.keepAliveInterval);
     sessionData.keepAliveInterval = null;
   }
-
   if (sessionData.sock) {
     try {
       if (sessionData.sock.user) await sessionData.sock.logout();
-    } catch (e) {
-      logger.warn(`[${sessionId}] Erro logout: ${e.message}`);
-    }
+    } catch (e) { logger.warn(`Erro logout: ${e.message}`); }
     sessionData.sock = null;
   }
   sessionData.qrCodeData = null;
@@ -274,11 +132,10 @@ async function cleanupSession(sessionId) {
   sessionData.connectionStatus = 'disconnected';
   sessionData.phoneNumber = null;
   sessionData.reconnectAttempts = 0;
-  logger.info(`[${sessionId}] Cleanup concluído`);
 }
 
 // ============================================
-// CRIAR CONEXÃO WHATSAPP
+// CONEXÃO WHATSAPP
 // ============================================
 async function createWhatsAppConnection(sessionId, options = {}) {
   const sessionData = await getOrCreateSession(sessionId);
@@ -286,26 +143,24 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   if (sessionData.sock) {
     const isConnected = sessionData.sock.user && sessionData.connectionStatus === 'connected';
     if (isConnected) {
-      logger.info(`[${sessionId}] ✅ Socket já conectado: ${sessionData.phoneNumber}`);
+      logger.info(`[${sessionId}] ✅ Já conectado: ${sessionData.phoneNumber}`);
       return sessionData;
     }
     await cleanupSession(sessionId);
   }
-
   sessionData.reconnectAttempts = 0;
   const authDir = path.join(__dirname, 'auth_info', sessionId);
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   sessionData.authState = { state, saveCreds };
-
   const { version } = await fetchLatestBaileysVersion();
-  logger.info(`[${sessionId}] Criando socket WhatsApp (versão ${version.join('.')})`);
   
   const sock = makeWASocket({
     version,
     auth: state,
     printQRInTerminal: options.printQR !== false,
-    logger: P({ level: 'silent' }),
-    // Identifica como WhatsApp Web oficial — evita "Aguardando mensagem"
+    logger: P({ level: 'warn' }),
+    // Identifica como WhatsApp Web oficial — corrige "Aguardando
+    // mensagem" no iPhone (confirmado hoje, mantido aqui)
     browser: ['WhatsApp Web', 'Chrome', '2.2412.54'],
     syncFullHistory: false,
     generateHighQualityLinkPreview: false,
@@ -313,22 +168,14 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       return { conversation: '' };
     },
   });
-
   sessionData.sock = sock;
-
-  // ============================================
-  // CONNECTION UPDATE
-  // ============================================
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
     if (qr) {
       sessionData.qrCodeData = qr;
       sessionData.qrExpiry = Date.now() + 60000;
       sessionData.connectionStatus = 'qr_ready';
-      logger.info(`[${sessionId}] 📱 QR Code disponível`);
     }
-
     if (connection === 'open') {
       sessionData.connectionStatus = 'connected';
       sessionData.phoneNumber = sock.user?.id?.split(':')[0] || null;
@@ -337,202 +184,114 @@ async function createWhatsAppConnection(sessionId, options = {}) {
       sessionData.reconnectAttempts = 0;
       logger.info(`[${sessionId}] ✅ CONECTADO: ${sessionData.phoneNumber}`);
 
-      // Keep-alive — evita "Aguardando mensagem" por inatividade
-      if (sessionData.keepAliveInterval) {
-        clearInterval(sessionData.keepAliveInterval);
-      }
+      // Keep-alive — evita "Aguardando mensagem" por inatividade (iPhone)
+      if (sessionData.keepAliveInterval) clearInterval(sessionData.keepAliveInterval);
       sessionData.keepAliveInterval = setInterval(async () => {
         try {
           if (sessionData.connectionStatus === 'connected' && sessionData.sock) {
             await sock.sendPresenceUpdate('available');
-            logger.info(`[${sessionId}] 💓 Keep-alive OK`);
           }
         } catch (e) {
-          logger.warn(`[${sessionId}] 💔 Keep-alive falhou: ${e.message}`);
+          logger.warn(`[${sessionId}] Keep-alive falhou: ${e.message}`);
         }
       }, 3 * 60 * 1000);
 
       await sendWebhook({
-        event: 'status-updated', sessionId,
-        status: 'connected', connected: true,
-        phone: { number: sessionData.phoneNumber }
+        event: 'status-updated', sessionId, status: 'connected',
+        connected: true, phone: { number: sessionData.phoneNumber }
       });
-
-      // Envia o mapa de LIDs conhecidos ao CRM assim que conecta,
-      // para reprocessar conversas presas sem esperar nova mensagem
-      pushLidMapToCrm(sessionId);
     }
-
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      logger.warn(`[${sessionId}] ❌ Conexão fechada (código: ${statusCode})`);
 
       if (sessionData.keepAliveInterval) {
         clearInterval(sessionData.keepAliveInterval);
         sessionData.keepAliveInterval = null;
       }
-
+      
       sessionData.connectionStatus = 'disconnected';
       sessionData.qrCodeData = null;
       sessionData.qrExpiry = null;
       sessionData.phoneNumber = null;
-
+      
       await sendWebhook({
-        event: 'status-updated', sessionId,
-        status: 'disconnected', connected: false
+        event: 'status-updated', sessionId, status: 'disconnected', connected: false
       });
-
       if (shouldReconnect && sessionData.reconnectAttempts < 3) {
         sessionData.reconnectAttempts++;
         const delay = 5000 * sessionData.reconnectAttempts;
-        logger.info(`[${sessionId}] Reconectando ${sessionData.reconnectAttempts}/3 em ${delay}ms`);
         setTimeout(() => createWhatsAppConnection(sessionId, options), delay);
-      } else if (sessionData.reconnectAttempts >= 3) {
-        logger.error(`[${sessionId}] Limite de reconexões atingido`);
       }
     }
   });
-
   sock.ev.on('creds.update', saveCreds);
 
   // ============================================
-  // Fontes ADITIVAS de mapeamento lid<->phone
-  // (não bloqueiam nada, só alimentam o cache)
-  // ============================================
-  sock.ev.on('contacts.upsert', (contacts) => {
-    for (const contact of contacts) {
-      if (contact.id && contact.id.endsWith('@s.whatsapp.net') && contact.lid) {
-        // direção: telefone → lid (o que o WhatsApp espera para enviar)
-        registerLidPhonePair(contact.lid, contact.id, 'contacts.upsert');
-      }
-    }
-  });
-
-  sock.ev.on('contacts.update', (updates) => {
-    for (const update of updates) {
-      if (update.lid && update.id) {
-        registerLidPhonePair(update.lid, update.id, 'contacts.update');
-      }
-    }
-  });
-
-  sock.ev.on('messaging-history.set', ({ contacts }) => {
-    if (!Array.isArray(contacts)) return;
-    let count = 0;
-    for (const contact of contacts) {
-      if (contact?.id && contact?.lid) {
-        registerLidPhonePair(contact.lid, contact.id, 'history.set');
-        count++;
-      }
-    }
-    if (count > 0) {
-      logger.info(`[${sessionId}] [HISTORY] ${count} contatos com lid mapeados, cache total: ${jidMap.size}`);
-    }
-  });
-
-  // Listeners adicionais — seguros mesmo se não existirem nesta
-  // versão do Baileys (EventEmitter simplesmente não dispara).
-  try {
-    sock.ev.on('contacts.set', (c) => {
-      const list = Array.isArray(c) ? c : (c?.contacts || []);
-      let count = 0;
-      for (const contact of list) {
-        if (contact?.id && contact?.lid) {
-          registerLidPhonePair(contact.lid, contact.id, 'contacts.set');
-          count++;
-        }
-      }
-      if (count > 0) logger.info(`[${sessionId}] [CONTACTS.SET] ${count} mapeados`);
-    });
-  } catch (e) {
-    logger.warn(`[${sessionId}] contacts.set não disponível: ${e.message}`);
-  }
-
-  try {
-    sock.ev.on('lid-mapping.update', (m) => {
-      const entries = Array.isArray(m) ? m : (m ? [m] : []);
-      for (const entry of entries) {
-        if (entry?.lid && entry?.pn) {
-          registerLidPhonePair(entry.lid, entry.pn, 'lid-mapping.update');
-        }
-      }
-    });
-  } catch (e) {
-    logger.warn(`[${sessionId}] lid-mapping.update não disponível: ${e.message}`);
-  }
-
-  // ============================================
-  // MESSAGES UPSERT
+  // RECEBIMENTO DE MENSAGENS
+  // IDÊNTICO ao original — normalizeJid não alterado
   // ============================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message) continue;
-      const remoteJid = msg.key.remoteJid || '';
-
-      // Ignora grupos, newsletters, broadcasts e status
-      if (
-        remoteJid.endsWith('@g.us') ||
-        remoteJid.endsWith('@newsletter') ||
-        remoteJid.endsWith('@broadcast') ||
-        remoteJid === 'status@broadcast'
-      ) {
-        continue;
-      }
-
-      const isFromMe = msg.key.fromMe === true;
-
-      // Salva o mapeamento JID (resolve LID + contato fantasma)
-      // Só para mensagens recebidas — igual à versão original
-      if (!isFromMe) {
-        saveJidFromMessage(msg.key);
-
-        // Fontes extras de aprendizado, quando presentes na própria mensagem
-        if (msg.key.senderLid && msg.key.senderPn) {
-          registerLidPhonePair(msg.key.senderLid, msg.key.senderPn, 'msg.senderLid');
-        }
-        if (msg.key.participantPn && remoteJid.endsWith('@lid')) {
-          registerLidPhonePair(remoteJid, msg.key.participantPn, 'msg.participantPn');
-        }
-
-        // Se ainda não temos esse LID mapeado, consulta o repositório
-        // interno do Baileys (populado por sync/decrypt). Log explícito
-        // do resultado — sem isso ficamos adivinhando.
-        if (remoteJid.endsWith('@lid')) {
-          const lidClean = remoteJid.split('@')[0];
-          const known = [...jidMap.values()].includes(remoteJid);
-          if (!known) {
-            try {
-              const lidMapping = sock.signalRepository?.lidMapping;
-              if (lidMapping?.getPNForLID) {
-                const pn = await lidMapping.getPNForLID(remoteJid);
-                if (pn) {
-                  registerLidPhonePair(remoteJid, pn, 'signalRepository');
-                  logger.info(`[${sessionId}] [SIGNAL-REPO] ${lidClean} → ${pn}`);
-                } else {
-                  logger.info(`[${sessionId}] [SIGNAL-REPO] ${lidClean} → sem resultado (pn vazio)`);
-                }
-              } else {
-                logger.info(`[${sessionId}] [SIGNAL-REPO] lidMapping.getPNForLID indisponível nesta versão`);
-              }
-            } catch (e) {
-              logger.warn(`[${sessionId}] [SIGNAL-REPO] erro ao consultar ${lidClean}: ${e.message}`);
-            }
-          }
-        }
-      }
-
+      if (!msg.message || msg.key.fromMe) continue;
+      const remoteJid = normalizeJid(msg.key.remoteJid);
       const messageType = Object.keys(msg.message)[0];
       let content = '';
-      if (messageType === 'conversation') {
-        content = msg.message.conversation;
-      } else if (messageType === 'extendedTextMessage') {
-        content = msg.message.extendedTextMessage?.text || '';
+      let interactionType = 'text';
+      switch (messageType) {
+        case 'conversation':
+          content = msg.message.conversation;
+          break;
+        case 'extendedTextMessage':
+          content = msg.message.extendedTextMessage.text;
+          break;
+        case 'buttonsResponseMessage':
+          content = msg.message.buttonsResponseMessage.selectedButtonId || 
+                    msg.message.buttonsResponseMessage.selectedDisplayText || '';
+          interactionType = 'button_response';
+          break;
+        case 'listResponseMessage':
+          content = msg.message.listResponseMessage.singleSelectReply?.selectedRowId || '';
+          interactionType = 'list_response';
+          break;
+        case 'templateButtonReplyMessage':
+          content = msg.message.templateButtonReplyMessage.selectedId || '';
+          interactionType = 'template_response';
+          break;
+        case 'interactiveResponseMessage':
+          try {
+            const paramsJson = msg.message.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson;
+            if (paramsJson) {
+              const params = JSON.parse(paramsJson);
+              content = params.id || params.display_text || JSON.stringify(params);
+            }
+            interactionType = 'interactive_response';
+          } catch (e) {
+            logger.error(`Erro ao parsear interactiveResponse: ${e.message}`);
+          }
+          break;
+        case 'imageMessage':
+          content = msg.message.imageMessage.caption || '[imagem]';
+          interactionType = 'image';
+          break;
+        case 'audioMessage':
+          content = '[áudio]';
+          interactionType = 'audio';
+          break;
+        case 'videoMessage':
+          content = msg.message.videoMessage.caption || '[vídeo]';
+          interactionType = 'video';
+          break;
+        case 'documentMessage':
+          content = msg.message.documentMessage.fileName || '[documento]';
+          interactionType = 'document';
+          break;
+        default:
+          content = `[${messageType}]`;
       }
+      logger.info(`[${sessionId}] 💬 ${remoteJid} (${interactionType}): ${content}`);
 
-      logger.info(`[${sessionId}] ${isFromMe ? '📤' : '💬'} ${remoteJid}: ${content}`);
-
-      // Download de áudio
+      // Download de áudio (adição útil, não mexe em LID)
       let audioBase64 = null;
       let audioMimetype = null;
       if (msg.message.audioMessage) {
@@ -544,20 +303,8 @@ async function createWhatsAppConnection(sessionId, options = {}) {
           audioBase64 = buffer.toString('base64');
           audioMimetype = msg.message.audioMessage.mimetype || 'audio/ogg; codecs=opus';
         } catch (e) {
-          logger.error(`[${sessionId}] ❌ Erro ao baixar áudio: ${e.message}`);
+          logger.error(`[${sessionId}] Erro ao baixar áudio: ${e.message}`);
         }
-      }
-
-      // key permanece IDÊNTICA ao original (msg.key puro).
-      // O telefone resolvido vai como campo ADICIONAL, fora da key,
-      // para o CRM usar sem depender de reprocessar o remoteJid.
-      let resolvedPhoneForWebhook = null;
-      if (remoteJid.endsWith('@lid')) {
-        for (const [phone, jid] of jidMap.entries()) {
-          if (jid === remoteJid) { resolvedPhoneForWebhook = phone; break; }
-        }
-      } else if (remoteJid.endsWith('@s.whatsapp.net')) {
-        resolvedPhoneForWebhook = remoteJid.replace(/\D/g, '').split('@')[0].split(':')[0];
       }
 
       await sendWebhook({
@@ -565,27 +312,27 @@ async function createWhatsAppConnection(sessionId, options = {}) {
         sessionId,
         instanceId: sessionId,
         data: {
-          key: msg.key,
+          key: { ...msg.key, remoteJid },
           message: msg.message,
+          messageType,
+          interactionType,
+          content,
           messageTimestamp: msg.messageTimestamp,
           pushName: msg.pushName,
-          fromMe: isFromMe,
           audioBase64,
           audioMimetype,
-          resolvedPhone: resolvedPhoneForWebhook,
         }
       });
     }
   });
-
   return sessionData;
 }
 
 // ============================================
-// ENDPOINTS
+// ENDPOINTS BÁSICOS
 // ============================================
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: process.uptime(), sessions: sessions.size, knownContacts: jidMap.size });
+  res.json({ status: 'ok', uptime: process.uptime(), sessions: sessions.size });
 });
 
 app.post('/create-session', async (req, res) => {
@@ -603,7 +350,6 @@ app.post('/create-session', async (req, res) => {
     }
     return res.json({ success: true, status: sessionData.connectionStatus });
   } catch (error) {
-    logger.error(`Erro /create-session: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
@@ -622,7 +368,8 @@ app.get('/qrcode', async (req, res) => {
     }
     if (sessionData.qrCodeData) {
       const qrBase64 = await QRCode.toDataURL(sessionData.qrCodeData);
-      return res.json({ qrcode: qrBase64, status: sessionData.connectionStatus, expiresIn: Math.max(0, Math.floor((sessionData.qrExpiry - Date.now()) / 1000)) });
+      return res.json({ qrcode: qrBase64, status: sessionData.connectionStatus,
+        expiresIn: Math.max(0, Math.floor((sessionData.qrExpiry - Date.now()) / 1000)) });
     }
     return res.json({ status: sessionData.connectionStatus });
   } catch (error) {
@@ -630,16 +377,23 @@ app.get('/qrcode', async (req, res) => {
   }
 });
 
+app.get('/sessions/:id/qrcode', async (req, res) => {
+  req.query.sessionId = req.params.id;
+  return app._router.handle(req, res);
+});
+
 app.post('/disconnect', async (req, res) => {
   try {
-    await cleanupSession(req.body.sessionId || 'default');
+    const sid = req.body.sessionId || 'default';
+    await cleanupSession(sid);
     res.json({ success: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.post('/logout', async (req, res) => {
   try {
-    await cleanupSession(req.body.sessionId || 'default');
+    const sid = req.body.sessionId || 'default';
+    await cleanupSession(sid);
     res.json({ success: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -655,228 +409,260 @@ app.delete('/session/:sessionId?', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+// ============================================
+// 1. ENVIAR MENSAGEM DE TEXTO
+// ============================================
 app.post('/send-message', async (req, res) => {
   try {
     const { sessionId, phone, message } = req.body;
     const sid = sessionId || 'default';
-    if (!phone || !message) return res.status(400).json({ error: 'phone e message são obrigatórios' });
+    if (!phone || !message) return res.status(400).json({ error: 'phone e message obrigatórios' });
     const sessionData = sessions.get(sid);
     if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
-    const sock = sessionData.sock;
-    const jid = resolveJid(phone);
-    logger.info(`[${sid}] 📤 Enviando para jid=${jid} (phone=${phone})`);
-    const result = await sock.sendMessage(jid, { text: message });
-    logger.info(`[${sid}] ✅ Enviado para ${jid} (id: ${result?.key?.id})`);
-    res.json({ success: true, jid, messageId: result?.key?.id });
+    const jid = normalizeJid(phone);
+    await sessionData.sock.sendMessage(jid, { text: message });
+    
+    logger.info(`[${sid}] ✅ Texto enviado para ${jid}`);
+    res.json({ success: true, jid });
   } catch (error) {
-    logger.error(`Erro /send-message: ${error.message}`);
+    logger.error(`Erro send-message: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
 
+// ============================================
+// 2. ENVIAR BOTÕES (interactiveMessage / nativeFlow)
+// ============================================
 app.post('/send-buttons', async (req, res) => {
   try {
-    const { sessionId, phone, text, footer, title, buttons } = req.body;
+    const { sessionId, phone, text, footer, buttons, title } = req.body;
     const sid = sessionId || 'default';
     if (!phone || !text || !buttons || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ error: 'phone, text e buttons são obrigatórios' });
+      return res.status(400).json({ error: 'phone, text e buttons obrigatórios' });
     }
     const sessionData = sessions.get(sid);
     if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
-    const jid = resolveJid(phone);
+    const jid = normalizeJid(phone);
     const nativeButtons = buttons.map(btn => ({
       name: 'quick_reply',
-      buttonParamsJson: JSON.stringify({ display_text: btn.text, id: btn.id })
+      buttonParamsJson: JSON.stringify({
+        display_text: btn.text,
+        id: btn.id
+      })
     }));
     const interactiveMsg = {
       interactiveMessage: proto.Message.InteractiveMessage.fromObject({
         body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
         footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
-        header: proto.Message.InteractiveMessage.Header.fromObject({ title: title || '', subtitle: '', hasMediaAttachment: false }),
-        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({ buttons: nativeButtons })
+        header: proto.Message.InteractiveMessage.Header.fromObject({
+          title: title || '',
+          subtitle: '',
+          hasMediaAttachment: false
+        }),
+        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
+          buttons: nativeButtons
+        })
       })
     };
-    const msg = generateWAMessageFromContent(jid, { viewOnceMessage: { message: interactiveMsg } }, {});
+    const msg = generateWAMessageFromContent(jid, {
+      viewOnceMessage: { message: interactiveMsg }
+    }, {});
     await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    logger.info(`[${sid}] 🔘 Botões enviados para ${jid}`);
+    logger.info(`[${sid}] 🔘 Botões enviados para ${jid} (${buttons.length} botões)`);
     res.json({ success: true, jid, type: 'buttons' });
   } catch (error) {
-    logger.error(`Erro /send-buttons: ${error.message}`);
+    logger.error(`Erro send-buttons: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
 
+// ============================================
+// 3. ENVIAR MENU/LISTA
+// ============================================
 app.post('/send-list', async (req, res) => {
   try {
     const { sessionId, phone, text, title, buttonText, footer, sections } = req.body;
     const sid = sessionId || 'default';
     if (!phone || !text || !sections || !Array.isArray(sections) || sections.length === 0) {
-      return res.status(400).json({ error: 'phone, text e sections são obrigatórios' });
+      return res.status(400).json({ error: 'phone, text e sections obrigatórios' });
     }
     const sessionData = sessions.get(sid);
     if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
-    const jid = resolveJid(phone);
+    const jid = normalizeJid(phone);
     const listParams = {
       title: buttonText || 'Ver opções',
       sections: sections.map(section => ({
         title: section.title || '',
-        rows: section.rows.map(row => ({ header: '', title: row.title, description: row.description || '', id: row.id }))
+        rows: section.rows.map(row => ({
+          header: '',
+          title: row.title,
+          description: row.description || '',
+          id: row.id
+        }))
       }))
     };
     const interactiveMsg = {
       interactiveMessage: proto.Message.InteractiveMessage.fromObject({
         body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
         footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
-        header: proto.Message.InteractiveMessage.Header.fromObject({ title: title || '', subtitle: '', hasMediaAttachment: false }),
+        header: proto.Message.InteractiveMessage.Header.fromObject({
+          title: title || '',
+          subtitle: '',
+          hasMediaAttachment: false
+        }),
         nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
-          buttons: [{ name: 'single_select', buttonParamsJson: JSON.stringify(listParams) }]
+          buttons: [{
+            name: 'single_select',
+            buttonParamsJson: JSON.stringify(listParams)
+          }]
         })
       })
     };
-    const msg = generateWAMessageFromContent(jid, { viewOnceMessage: { message: interactiveMsg } }, {});
+    const msg = generateWAMessageFromContent(jid, {
+      viewOnceMessage: { message: interactiveMsg }
+    }, {});
     await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    logger.info(`[${sid}] 📋 Menu enviado para ${jid}`);
+    logger.info(`[${sid}] 📋 Menu enviado para ${jid} (${sections.length} seção(ões))`);
     res.json({ success: true, jid, type: 'list' });
   } catch (error) {
-    logger.error(`Erro /send-list: ${error.message}`);
+    logger.error(`Erro send-list: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
 
+// ============================================
+// 4. ENVIAR BOTÃO COM LINK
+// ============================================
 app.post('/send-link-button', async (req, res) => {
   try {
-    const { sessionId, phone, text, footer, title, buttons } = req.body;
+    const { sessionId, phone, text, footer, buttons, title } = req.body;
     const sid = sessionId || 'default';
     if (!phone || !text || !buttons || !Array.isArray(buttons) || buttons.length === 0) {
-      return res.status(400).json({ error: 'phone, text e buttons são obrigatórios' });
+      return res.status(400).json({ error: 'phone, text e buttons obrigatórios' });
     }
     const sessionData = sessions.get(sid);
     if (!sessionData?.sock || sessionData.connectionStatus !== 'connected') {
       return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
-    const jid = resolveJid(phone);
+    const jid = normalizeJid(phone);
     const nativeButtons = buttons.map(btn => {
-      if (btn.url) return { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: btn.text, url: btn.url, merchant_url: btn.url }) };
-      if (btn.phoneNumber) return { name: 'cta_call', buttonParamsJson: JSON.stringify({ display_text: btn.text, phone_number: btn.phoneNumber }) };
-      return { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: btn.text, id: btn.id || btn.text }) };
+      if (btn.url) {
+        return {
+          name: 'cta_url',
+          buttonParamsJson: JSON.stringify({
+            display_text: btn.text,
+            url: btn.url,
+            merchant_url: btn.url
+          })
+        };
+      } else if (btn.phoneNumber) {
+        return {
+          name: 'cta_call',
+          buttonParamsJson: JSON.stringify({
+            display_text: btn.text,
+            phone_number: btn.phoneNumber
+          })
+        };
+      } else {
+        return {
+          name: 'quick_reply',
+          buttonParamsJson: JSON.stringify({
+            display_text: btn.text,
+            id: btn.id || btn.text
+          })
+        };
+      }
     });
     const interactiveMsg = {
       interactiveMessage: proto.Message.InteractiveMessage.fromObject({
         body: proto.Message.InteractiveMessage.Body.fromObject({ text }),
         footer: proto.Message.InteractiveMessage.Footer.fromObject({ text: footer || '' }),
-        header: proto.Message.InteractiveMessage.Header.fromObject({ title: title || '', subtitle: '', hasMediaAttachment: false }),
-        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({ buttons: nativeButtons })
+        header: proto.Message.InteractiveMessage.Header.fromObject({
+          title: title || '',
+          subtitle: '',
+          hasMediaAttachment: false
+        }),
+        nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.fromObject({
+          buttons: nativeButtons
+        })
       })
     };
-    const msg = generateWAMessageFromContent(jid, { viewOnceMessage: { message: interactiveMsg } }, {});
+    const msg = generateWAMessageFromContent(jid, {
+      viewOnceMessage: { message: interactiveMsg }
+    }, {});
     await sessionData.sock.relayMessage(jid, msg.message, { messageId: msg.key.id });
-    logger.info(`[${sid}] 🔗 Link button enviado para ${jid}`);
+    logger.info(`[${sid}] 🔗 Botões com link enviados para ${jid}`);
     res.json({ success: true, jid, type: 'link_button' });
   } catch (error) {
-    logger.error(`Erro /send-link-button: ${error.message}`);
+    logger.error(`Erro send-link-button: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ============================================
-// RESOLVE LID — versão simples, só cache
-// GET ou POST, sempre responde algo previsível
+// 5. ENDPOINT UNIFICADO /send
 // ============================================
-async function handleResolveLid(req, res) {
+app.post('/send', async (req, res) => {
   try {
-    const params = req.method === 'POST' ? req.body : req.query;
-    const sessionId = params.sessionId || 'default';
-    const lidRaw = params.lid;
-    if (!lidRaw) return res.status(400).json({ error: 'lid é obrigatório' });
-
-    const lid = String(lidRaw).replace('@lid', '').replace(/\D/g, '');
-
-    // 1. Cache
-    const cached = jidMap.get(lid);
-    if (cached) {
-      const phone = cached.split('@')[0];
-      return res.json({ phone, jid: cached, source: 'cache' });
+    const { sessionId, phone, type, payload } = req.body;
+    const sid = sessionId || 'default';
+    if (!phone || !type || !payload) {
+      return res.status(400).json({ error: 'phone, type e payload obrigatórios' });
     }
-
-    // 2. Consulta ATIVA ao WhatsApp via onWhatsApp — só quando o cache falha
-    const sessionData = sessions.get(sessionId);
-    if (sessionData?.sock && sessionData.connectionStatus === 'connected') {
-      try {
-        const results = await sessionData.sock.onWhatsApp(`${lid}@lid`);
-        const first = results?.[0];
-        if (first?.jid && first.jid.endsWith('@s.whatsapp.net')) {
-          const phone = first.jid.split('@')[0];
-          registerLidPhonePair(lid, first.jid, 'onWhatsApp-active');
-          return res.json({ phone, jid: first.jid, source: 'active_query' });
-        }
-      } catch (e) {
-        logger.warn(`[${sessionId}] [RESOLVE-LID] onWhatsApp ativo falhou: ${e.message}`);
-      }
+    req.body = { sessionId: sid, phone, ...payload };
+    switch (type) {
+      case 'text':
+        req.body.message = payload.message || payload.text;
+        return app._router.handle({ ...req, url: '/send-message', method: 'POST' }, res);
+      case 'buttons':
+        return app._router.handle({ ...req, url: '/send-buttons', method: 'POST' }, res);
+      case 'list':
+      case 'menu':
+        return app._router.handle({ ...req, url: '/send-list', method: 'POST' }, res);
+      case 'link_button':
+      case 'url_button':
+        return app._router.handle({ ...req, url: '/send-link-button', method: 'POST' }, res);
+      default:
+        return res.status(400).json({ error: `Tipo "${type}" não suportado` });
     }
-
-    return res.json({ phone: null, jid: null, source: 'not_found' });
   } catch (error) {
-    logger.error(`Erro /resolve-lid: ${error.message}`);
     res.status(500).json({ error: error.message });
   }
-}
-app.get('/resolve-lid', handleResolveLid);
-app.post('/resolve-lid', handleResolveLid);
-
-// ============================================
-// GET /lid-map — CRM consulta o mapa completo
-// (sincronização sob demanda)
-// ============================================
-app.get('/lid-map', (req, res) => {
-  const entries = Object.fromEntries(jidMap);
-  res.json({ success: true, count: Object.keys(entries).length, map: entries });
 });
 
 // ============================================
-// POST /resolve-lid — resolve em lote
-// Body: { lids: ["123", "456@lid", ...] }
+// STATUS
 // ============================================
-app.post('/resolve-lid', (req, res) => {
-  const { lids, lid } = req.body || {};
-  const list = Array.isArray(lids) ? lids : (lid ? [lid] : []);
-  if (list.length === 0) {
-    return res.status(400).json({ error: 'lids (array) ou lid é obrigatório' });
-  }
-
-  const results = {};
-  for (const raw of list) {
-    const cleaned = String(raw).replace('@lid', '').replace(/\D/g, '');
-    // Procura no jidMap por qualquer par onde o LID bate
-    let found = null;
-    for (const [phone, jid] of jidMap.entries()) {
-      if (jid.includes(cleaned)) { found = phone; break; }
-    }
-    results[raw] = found ? { phone: found, jid: jidMap.get(found) } : null;
-  }
-
-  res.json({ success: true, results });
-});
-
 app.get('/status', (req, res) => {
   const allSessions = {};
   sessions.forEach((data, sid) => {
-    allSessions[sid] = { status: data.connectionStatus, phone: data.phoneNumber, hasQR: !!data.qrCodeData, reconnectAttempts: data.reconnectAttempts };
+    allSessions[sid] = {
+      status: data.connectionStatus,
+      phone: data.phoneNumber,
+      hasQR: !!data.qrCodeData,
+      reconnectAttempts: data.reconnectAttempts
+    };
   });
-  res.json({ success: true, uptime: process.uptime(), totalSessions: sessions.size, knownContacts: jidMap.size, sessions: allSessions });
+  res.json({ success: true, uptime: process.uptime(), totalSessions: sessions.size, sessions: allSessions });
 });
 
-loadJidMapFromDisk();
-
+// ============================================
+// SERVIDOR
+// ============================================
 app.listen(PORT, () => {
   logger.info(`🚀 Servidor Baileys rodando na porta ${PORT}`);
-  logger.info(`🔐 API Key: ${API_KEY ? '✅' : '❌'}`);
-  logger.info(`🪝 Webhook: ${WEBHOOK_URL || 'Não configurado'}`);
+  logger.info(`📋 Endpoints disponíveis:`);
+  logger.info(`   POST /send-message     → Texto`);
+  logger.info(`   POST /send-buttons     → Botões (interactiveMessage)`);
+  logger.info(`   POST /send-list        → Menu/Lista`);
+  logger.info(`   POST /send-link-button → Botão com URL`);
+  logger.info(`   POST /send             → Roteador unificado`);
 });
 
 process.on('SIGINT', async () => {
