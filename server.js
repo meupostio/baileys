@@ -24,6 +24,55 @@ const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 // ============================================
 const sessions = new Map(); // sessionId -> { sock, qrCodeData, connectionStatus, authState, phoneNumber, reconnectAttempts }
 
+// ============================================
+// LID MAP — vínculo lid <-> telefone, persistido em disco
+// ============================================
+const lidMaps = new Map(); // sessionId -> Map(lid -> phone)
+
+function lidFile(sessionId) {
+  return path.join(__dirname, 'auth_info', sessionId, 'lid-map.json');
+}
+function loadLidMap(sessionId) {
+  if (lidMaps.has(sessionId)) return lidMaps.get(sessionId);
+  let m = new Map();
+  try {
+    const f = lidFile(sessionId);
+    if (fs.existsSync(f)) m = new Map(Object.entries(JSON.parse(fs.readFileSync(f, 'utf8'))));
+  } catch (e) { logger.warn(`[${sessionId}] lid-map inválido: ${e.message}`); }
+  lidMaps.set(sessionId, m);
+  return m;
+}
+function saveLidMap(sessionId) {
+  try {
+    const m = loadLidMap(sessionId);
+    fs.mkdirSync(path.dirname(lidFile(sessionId)), { recursive: true });
+    fs.writeFileSync(lidFile(sessionId), JSON.stringify(Object.fromEntries(m)));
+  } catch (e) { logger.warn(`[${sessionId}] falha ao salvar lid-map: ${e.message}`); }
+}
+const digitsOf = (v) => String(v || '').split('@')[0].replace(/[^0-9]/g, '');
+function rememberLid(sessionId, lid, phone) {
+  const l = digitsOf(lid), p = digitsOf(phone);
+  if (!l || !p || l === p || p.length < 10 || p.length > 14) return;
+  const m = loadLidMap(sessionId);
+  if (m.get(l) === p) return;
+  m.set(l, p);
+  saveLidMap(sessionId);
+  logger.info(`[${sessionId}] 🔗 LID ${l} => ${p}`);
+}
+async function resolveLid(sessionId, lid) {
+  const l = digitsOf(lid);
+  if (!l) return null;
+  const cached = loadLidMap(sessionId).get(l);
+  if (cached) return cached;
+  const sd = sessions.get(sessionId);
+  try {
+    const pn = await sd?.sock?.signalRepository?.lidMapping?.getPNForLID?.(`${l}@lid`);
+    const p = digitsOf(pn);
+    if (p) { rememberLid(sessionId, l, p); return p; }
+  } catch (e) { logger.warn(`[${sessionId}] getPNForLID falhou: ${e.message}`); }
+  return null;
+}
+
 // Captura erros não tratados — evita crash do processo (única adição de segurança)
 process.on('uncaughtException', (err) => {
   console.error('❌ uncaughtException:', err.message, err.stack);
@@ -272,27 +321,48 @@ async function createWhatsAppConnection(sessionId, options = {}) {
   // ============================================
   sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      const remoteJid = msg.key.remoteJid;
+      if (!msg.message) continue;
+
+      const key = msg.key || {};
+      // aprende o vínculo de todos os campos que o WhatsApp mandar
+      const lidJid = [key.remoteJid, key.participant, key.remoteJidAlt, key.senderPn]
+        .find((j) => typeof j === 'string' && j.endsWith('@lid'));
+      const pnJid = [key.senderPn, key.participantPn, key.remoteJidAlt, key.remoteJid]
+        .find((j) => typeof j === 'string' && j.endsWith('@s.whatsapp.net'));
+      if (lidJid && pnJid) rememberLid(sessionId, lidJid, pnJid);
+
+      let phone = digitsOf(pnJid);
+      if (!phone && lidJid) phone = (await resolveLid(sessionId, lidJid)) || '';
+
       const messageType = Object.keys(msg.message)[0];
       let content = '';
-      if (messageType === 'conversation') {
-        content = msg.message.conversation;
-      } else if (messageType === 'extendedTextMessage') {
-        content = msg.message.extendedTextMessage.text;
-      }
-      logger.info(`[${sessionId}] 💬 Mensagem de ${remoteJid}: ${content}`);
+      if (messageType === 'conversation') content = msg.message.conversation;
+      else if (messageType === 'extendedTextMessage') content = msg.message.extendedTextMessage.text;
+
+      logger.info(`[${sessionId}] 💬 ${key.remoteJid} (${phone || 'sem número'}): ${content}`);
+
       await sendWebhook({
-        event: 'received-message',
+        event: key.fromMe ? 'message-sent' : 'received-message',
         sessionId,
         instanceId: sessionId,
         data: {
-          key: msg.key,
+          key,
+          phone: phone || null,
+          senderPn: key.senderPn || (phone ? `${phone}@s.whatsapp.net` : null),
+          remoteJidAlt: key.remoteJidAlt || null,
+          fromMe: !!key.fromMe,
           message: msg.message,
           messageTimestamp: msg.messageTimestamp,
           pushName: msg.pushName
         }
       });
+    }
+  });
+
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts || []) {
+      if (c?.lid && c?.id) rememberLid(sessionId, c.lid, c.id);
+      if (c?.id?.endsWith?.('@lid') && c?.phoneNumber) rememberLid(sessionId, c.id, c.phoneNumber);
     }
   });
   return sessionData;
@@ -445,6 +515,17 @@ app.post('/send-message', async (req, res) => {
     logger.error(`Erro em /send-message:`, error);
     res.status(500).json({ error: error.message });
   }
+});
+
+app.get('/resolve-lid', async (req, res) => {
+  const sessionId = req.query.sessionId || 'default';
+  const phone = await resolveLid(sessionId, req.query.lid);
+  res.json(phone ? { success: true, phone, jid: `${phone}@s.whatsapp.net` } : { success: false, reason: 'not_found' });
+});
+
+app.get('/lid-map', (req, res) => {
+  const sessionId = req.query.sessionId || 'default';
+  res.json({ success: true, map: Object.fromEntries(loadLidMap(sessionId)) });
 });
 
 app.get('/status', (req, res) => {
