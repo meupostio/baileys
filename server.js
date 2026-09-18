@@ -1,21 +1,22 @@
 /**
- * Baileys multi-sessão — versão corrigida (Render)
+ * Baileys multi-sessão — Render (v1.1)
  *
- * Correções em relação à versão anterior:
- *  1. Credenciais e chaves de sessão gravadas no banco (tabela
- *     public.whatsapp_session_keys), não mais no disco temporário do Render.
- *  2. Uma única sessão por sessionId: mutex + encerramento do socket anterior,
- *     reconexão com espera crescente.
- *  3. getMessage: responde aos pedidos de reenvio do aparelho do contato
- *     (é o que destrava o "Aguardando mensagem").
- *  4. Bad MAC tratado por conversa: apaga só a sessão daquele contato.
- *  5. Webhook "session-error" avisa o CRM.
+ * O que esta versão faz:
+ *  1. Credenciais e chaves Signal gravadas no Supabase (public.whatsapp_session_keys).
+ *     Sem Supabase configurado, cai para disco (AUTH_DIR) e avisa no log —
+ *     o servidor NUNCA derruba no boot por falta de env.
+ *  2. Mensagens enviadas ficam em cache em memória E no banco
+ *     (public.whatsapp_message_cache). É isso que responde ao pedido de reenvio
+ *     do aparelho do contato e destrava o "Aguardando mensagem" — inclusive
+ *     depois de um restart do Render.
+ *  3. Uma sessão por sessionId (mutex), reconexão com espera crescente e
+ *     tratamento correto de cada motivo de desconexão (515, 440, 401, 403, 500).
+ *  4. Falha de decriptação (CIPHERTEXT / Bad MAC) tratada por conversa.
+ *  5. Encerramento limpo no SIGTERM (redeploy do Render) para não gerar
+ *     "connection replaced" entre a instância velha e a nova.
  *
- * Dependências novas: @supabase/supabase-js
- *   npm i @supabase/supabase-js
- *
- * Env: PORT, API_KEY, WEBHOOK_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
- *      (AUTH_DIR não é mais usado)
+ * Dependências: express, pino, qrcode, @supabase/supabase-js, @whiskeysockets/baileys
+ * Env: PORT, API_KEY, WEBHOOK_URL, SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, AUTH_DIR (fallback)
  */
 const express = require("express");
 const P = require("pino");
@@ -26,6 +27,10 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   initAuthCreds,
+  useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
+  WAMessageStubType,
+  Browsers,
   BufferJSON,
   proto,
 } = require("@whiskeysockets/baileys");
@@ -35,63 +40,83 @@ const API_KEY = process.env.API_KEY || "";
 const WEBHOOK_URL = process.env.WEBHOOK_URL || "";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 
-const logger = P({ level: "info" });
+const KEYS_TABLE = "whatsapp_session_keys";
+const MSG_TABLE = "whatsapp_message_cache";
+const MSG_CACHE_TTL_DAYS = 7;
 
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  logger.error("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY ausentes — sessões não serão persistidas");
+const logger = P({ level: process.env.LOG_LEVEL || "info" });
+
+/* ------------------------------ supabase (opcional) ------------------------------ */
+
+let db = null;
+if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+  db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+  logger.info("[auth] sessões persistidas no Supabase");
+} else {
+  logger.error(
+    "[auth] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY ausentes — usando disco (%s). " +
+      "No Render o disco é temporário: a sessão se perde a cada restart.",
+    AUTH_DIR,
+  );
 }
-const db = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.use((req, res, next) => {
-  if (req.path === "/") return next();
+  if (req.path === "/" || req.path === "/health") return next();
   if (!API_KEY) return next();
   if (req.headers["x-api-key"] !== API_KEY) return res.status(401).json({ error: "Unauthorized" });
   next();
 });
 
-const onlyDigits = (v) => String(v || "").split("@")[0].replace(/[^0-9]/g, "");
+const onlyDigits = (v) => String(v || "").split("@")[0].split(":")[0].replace(/[^0-9]/g, "");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const nowIso = () => new Date().toISOString();
 
 /* ---------------------- auth state persistido no banco ---------------------- */
 
 const encode = (value) => JSON.parse(JSON.stringify(value, BufferJSON.replacer));
 const decode = (value) => JSON.parse(JSON.stringify(value), BufferJSON.reviver);
 
-async function dbRead(sessionId, key) {
+async function dbReadMany(sessionId, keys) {
+  const out = {};
+  if (!db || !keys.length) return out;
   const { data, error } = await db
-    .from("whatsapp_session_keys")
-    .select("value")
+    .from(KEYS_TABLE)
+    .select("key,value")
     .eq("session_id", sessionId)
-    .eq("key", key)
-    .maybeSingle();
+    .in("key", keys);
   if (error) {
-    logger.warn({ sessionId, key, error: error.message }, "[auth] read failed");
-    return null;
+    logger.warn({ sessionId, error: error.message }, "[auth] read failed");
+    return out;
   }
-  return data ? decode(data.value) : null;
+  for (const row of data || []) {
+    try { out[row.key] = decode(row.value); } catch (e) {
+      logger.warn({ sessionId, key: row.key, e: e.message }, "[auth] decode failed");
+    }
+  }
+  return out;
+}
+
+async function dbRead(sessionId, key) {
+  const r = await dbReadMany(sessionId, [key]);
+  return r[key] ?? null;
 }
 
 async function dbWriteMany(sessionId, rows) {
-  if (!rows.length) return;
-  const { error } = await db
-    .from("whatsapp_session_keys")
-    .upsert(rows, { onConflict: "session_id,key" });
+  if (!db || !rows.length) return;
+  const { error } = await db.from(KEYS_TABLE).upsert(rows, { onConflict: "session_id,key" });
   if (error) logger.warn({ sessionId, error: error.message }, "[auth] write failed");
 }
 
 async function dbDeleteMany(sessionId, keys) {
-  if (!keys.length) return;
-  const { error } = await db
-    .from("whatsapp_session_keys")
-    .delete()
-    .eq("session_id", sessionId)
-    .in("key", keys);
+  if (!db || !keys.length) return;
+  const { error } = await db.from(KEYS_TABLE).delete().eq("session_id", sessionId).in("key", keys);
   if (error) logger.warn({ sessionId, error: error.message }, "[auth] delete failed");
 }
 
@@ -100,22 +125,21 @@ async function useSupabaseAuthState(sessionId) {
 
   const keys = {
     get: async (type, ids) => {
+      const wanted = ids.map((id) => `${type}-${id}`);
+      const rows = await dbReadMany(sessionId, wanted);
       const out = {};
-      await Promise.all(
-        ids.map(async (id) => {
-          let value = await dbRead(sessionId, `${type}-${id}`);
-          if (type === "app-state-sync-key" && value) {
-            value = proto.Message.AppStateSyncKeyData.fromObject(value);
-          }
-          if (value) out[id] = value;
-        }),
-      );
+      for (const id of ids) {
+        let value = rows[`${type}-${id}`];
+        if (!value) continue;
+        if (type === "app-state-sync-key") value = proto.Message.AppStateSyncKeyData.fromObject(value);
+        out[id] = value;
+      }
       return out;
     },
     set: async (data) => {
       const upserts = [];
       const deletes = [];
-      const now = new Date().toISOString();
+      const now = nowIso();
       for (const type of Object.keys(data)) {
         for (const id of Object.keys(data[type] || {})) {
           const value = data[type][id];
@@ -132,29 +156,91 @@ async function useSupabaseAuthState(sessionId) {
     state: { creds, keys },
     saveCreds: async () => {
       await dbWriteMany(sessionId, [
-        { session_id: sessionId, key: "creds", value: encode(creds), updated_at: new Date().toISOString() },
+        { session_id: sessionId, key: "creds", value: encode(creds), updated_at: nowIso() },
       ]);
     },
+    // Apaga só a sessão Signal de um contato (chaves "session-<user>.<device>")
     clearSessionFor: async (jid) => {
-      const digits = String(jid || "");
+      const user = String(jid || "").split("@")[0].split(":")[0];
+      if (!user) return;
       const { data } = await db
-        .from("whatsapp_session_keys")
+        .from(KEYS_TABLE)
         .select("key")
         .eq("session_id", sessionId)
-        .like("key", `session-${digits.split("@")[0]}%`);
+        .like("key", `session-${user}.%`);
       await dbDeleteMany(sessionId, (data || []).map((r) => r.key));
     },
     wipe: async () => {
-      await db.from("whatsapp_session_keys").delete().eq("session_id", sessionId);
+      await db.from(KEYS_TABLE).delete().eq("session_id", sessionId);
+      await db.from(MSG_TABLE).delete().eq("session_id", sessionId);
     },
   };
 }
 
+async function useDiskAuthState(sessionId) {
+  const fs = require("fs");
+  const path = require("path");
+  const dir = path.join(AUTH_DIR, String(sessionId).replace(/[^a-zA-Z0-9_-]/g, "_"));
+  const { state, saveCreds } = await useMultiFileAuthState(dir);
+  return {
+    state,
+    saveCreds,
+    clearSessionFor: async (jid) => {
+      const user = String(jid || "").split("@")[0].split(":")[0];
+      for (const f of fs.readdirSync(dir)) {
+        if (f.startsWith(`session-${user}.`)) fs.rmSync(path.join(dir, f), { force: true });
+      }
+    },
+    wipe: async () => fs.rmSync(dir, { recursive: true, force: true }),
+  };
+}
+
+const useAuthState = (sessionId) => (db ? useSupabaseAuthState(sessionId) : useDiskAuthState(sessionId));
+
+/* --------------------------- cache de mensagens enviadas --------------------------- */
+/* Necessário para responder ao "retry receipt" do aparelho do contato.          */
+/* Memória (rápido) + banco (sobrevive a restart).                                */
+
+async function persistSentMessage(sessionId, key, message) {
+  if (!db || !key?.id || !message) return;
+  const { error } = await db.from(MSG_TABLE).upsert(
+    {
+      session_id: sessionId,
+      message_id: key.id,
+      remote_jid: key.remoteJid || null,
+      message: encode(message),
+      created_at: nowIso(),
+    },
+    { onConflict: "session_id,message_id" },
+  );
+  if (error) logger.warn({ sessionId, error: error.message }, "[msgcache] write failed");
+}
+
+async function loadSentMessage(sessionId, id) {
+  if (!db || !id) return undefined;
+  const { data, error } = await db
+    .from(MSG_TABLE)
+    .select("message")
+    .eq("session_id", sessionId)
+    .eq("message_id", id)
+    .maybeSingle();
+  if (error || !data) return undefined;
+  try { return proto.Message.fromObject(decode(data.message)); } catch { return undefined; }
+}
+
+async function pruneMessageCache() {
+  if (!db) return;
+  const cutoff = new Date(Date.now() - MSG_CACHE_TTL_DAYS * 86400000).toISOString();
+  const { error } = await db.from(MSG_TABLE).delete().lt("created_at", cutoff);
+  if (error) logger.warn({ error: error.message }, "[msgcache] prune failed");
+}
+
 /* --------------------------------- estado --------------------------------- */
 
-/** sessionId -> { sock, status, qr, phone, lidMap, msgCache, badMac, auth, attempts, starting, stopped } */
+/** sessionId -> { sock, status, qr, phone, lidMap, msgCache, badMac, auth, attempts, stopped, reconnectTimer } */
 const sessions = new Map();
 const startLocks = new Map();
+let shuttingDown = false;
 
 function getSession(sessionId) {
   let s = sessions.get(sessionId);
@@ -170,6 +256,8 @@ function getSession(sessionId) {
       auth: null,
       attempts: 0,
       stopped: false,
+      reconnectTimer: null,
+      lastDisconnectCode: null,
     };
     sessions.set(sessionId, s);
   }
@@ -179,7 +267,7 @@ function getSession(sessionId) {
 function cacheMessage(s, key, message) {
   if (!key?.id || !message) return;
   s.msgCache.set(key.id, message);
-  if (s.msgCache.size > 1000) {
+  if (s.msgCache.size > 2000) {
     const first = s.msgCache.keys().next().value;
     s.msgCache.delete(first);
   }
@@ -206,6 +294,7 @@ async function resolveLid(sessionId, lidRaw) {
   const cached = s.lidMap.get(lid);
   if (cached) return cached;
 
+  // Baileys 7.x expõe o mapeamento LID -> PN; no 6.7.x isto simplesmente não existe.
   try {
     const mapping = s.sock?.signalRepository?.lidMapping;
     if (mapping?.getPNForLID) {
@@ -230,21 +319,49 @@ async function resolveLid(sessionId, lidRaw) {
 async function postWebhook(body) {
   if (!WEBHOOK_URL) return;
   try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 10000);
     await fetch(WEBHOOK_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: ctrl.signal,
     });
-  } catch (e) { logger.warn({ e: e.message }, "[webhook] failed"); }
+    clearTimeout(t);
+  } catch (e) { logger.warn({ e: e.message, event: body?.event }, "[webhook] failed"); }
 }
 
 /* --------------------------------- sessão ---------------------------------- */
 
 function closeSocket(s) {
-  try { s.sock?.ev?.removeAllListeners?.(); } catch {}
-  try { s.sock?.ws?.close?.(); } catch {}
-  try { s.sock?.end?.(new Error("replaced")); } catch {}
+  if (s.reconnectTimer) { clearTimeout(s.reconnectTimer); s.reconnectTimer = null; }
+  const sock = s.sock;
   s.sock = null;
+  if (!sock) return;
+  try { sock.ev?.removeAllListeners?.("connection.update"); } catch {}
+  try { sock.ev?.removeAllListeners?.("messages.upsert"); } catch {}
+  try { sock.ev?.removeAllListeners?.("creds.update"); } catch {}
+  try { sock.ws?.close?.(); } catch {}
+  try { sock.end?.(new Error("replaced")); } catch {}
+}
+
+function scheduleReconnect(sessionId, s, delayMs) {
+  if (s.stopped || shuttingDown) return;
+  if (s.reconnectTimer) clearTimeout(s.reconnectTimer);
+  s.reconnectTimer = setTimeout(() => {
+    s.reconnectTimer = null;
+    startSession(sessionId).catch((e) => logger.warn({ sessionId, e: e.message }, "[reconnect] failed"));
+  }, delayMs);
+}
+
+async function getWaVersion() {
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    return version;
+  } catch (e) {
+    logger.warn({ e: e.message }, "[version] fetchLatestBaileysVersion falhou, usando padrão");
+    return undefined; // Baileys usa a versão embutida
+  }
 }
 
 async function startSession(sessionId) {
@@ -257,19 +374,28 @@ async function startSession(sessionId) {
 
     closeSocket(s);
 
-    const auth = await useSupabaseAuthState(sessionId);
+    const auth = await useAuthState(sessionId);
     s.auth = auth;
-    const { version } = await fetchLatestBaileysVersion();
+    const version = await getWaVersion();
 
     const sock = makeWASocket({
-      version,
-      auth: auth.state,
-      printQRInTerminal: false,
+      ...(version ? { version } : {}),
+      auth: {
+        creds: auth.state.creds,
+        keys: makeCacheableSignalKeyStore(auth.state.keys, P({ level: "silent" })),
+      },
       logger: P({ level: "silent" }),
+      browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: false,
       markOnlineOnConnect: false,
-      // Responde aos pedidos de reenvio do aparelho do contato.
-      getMessage: async (key) => s.msgCache.get(key?.id) || undefined,
+      generateHighQualityLinkPreview: false,
+      // Responde aos pedidos de reenvio do aparelho do contato ("retry receipt").
+      // Sem isto o contato fica em "Aguardando mensagem".
+      getMessage: async (key) => {
+        const mem = s.msgCache.get(key?.id);
+        if (mem) return mem;
+        return loadSentMessage(sessionId, key?.id);
+      },
     });
 
     s.sock = sock;
@@ -279,11 +405,14 @@ async function startSession(sessionId) {
     sock.ev.on("creds.update", auth.saveCreds);
 
     sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+      if (s.sock !== sock) return; // evento de um socket antigo
+
       if (qr) {
         s.qr = await QRCode.toDataURL(qr);
         s.status = "qr";
         postWebhook({ event: "status-updated", sessionId, status: "qr_ready", qrcode: s.qr });
       }
+
       if (connection === "open") {
         s.status = "connected";
         s.qr = null;
@@ -291,25 +420,62 @@ async function startSession(sessionId) {
         s.badMac.clear();
         s.phone = onlyDigits(sock.user?.id);
         if (sock.user?.lid) learnLid(sessionId, sock.user.lid, s.phone);
+        logger.info({ sessionId, phone: s.phone }, "[session] conectada");
         postWebhook({ event: "status-updated", sessionId, status: "connected", phone: s.phone });
         const entries = [...s.lidMap].map(([lid, phone]) => ({ lid, phone }));
         if (entries.length) postWebhook({ event: "lid-map", sessionId, entries });
       }
+
       if (connection === "close") {
         const code = lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = code === DisconnectReason.loggedOut;
-        s.status = loggedOut ? "logged_out" : "disconnected";
+        const reason = lastDisconnect?.error?.message || "";
+        s.lastDisconnectCode = code || null;
         closeSocket(s);
-        postWebhook({ event: "status-updated", sessionId, status: s.status });
-        if (loggedOut) {
-          await auth.wipe();
+        logger.warn({ sessionId, code, reason }, "[session] conexão fechada");
+
+        // 401: o usuário desconectou o aparelho no WhatsApp -> limpa tudo, precisa de novo QR
+        if (code === DisconnectReason.loggedOut) {
+          s.status = "logged_out";
+          postWebhook({ event: "status-updated", sessionId, status: "logged_out" });
+          try { await auth.wipe(); } catch {}
           return;
         }
-        if (s.stopped) return;
+        // 403: número bloqueado/banido pelo WhatsApp -> não adianta reconectar
+        if (code === DisconnectReason.forbidden) {
+          s.status = "forbidden";
+          postWebhook({ event: "status-updated", sessionId, status: "forbidden" });
+          postWebhook({ event: "session-error", sessionId, reason: "forbidden", error: reason });
+          return;
+        }
+        // 440: outra instância abriu a mesma sessão (ex.: deploy antigo ainda no ar)
+        if (code === DisconnectReason.connectionReplaced) {
+          s.status = "replaced";
+          postWebhook({ event: "status-updated", sessionId, status: "replaced" });
+          logger.warn({ sessionId }, "[session] substituída por outra instância; tentando de novo em 30s");
+          scheduleReconnect(sessionId, s, 30000);
+          return;
+        }
+        // 500: credenciais corrompidas -> limpa e pede QR de novo
+        if (code === DisconnectReason.badSession) {
+          s.status = "bad_session";
+          postWebhook({ event: "status-updated", sessionId, status: "bad_session" });
+          try { await auth.wipe(); } catch {}
+          scheduleReconnect(sessionId, s, 1000);
+          return;
+        }
+        // 515: normal logo após parear o QR -> reconecta imediatamente
+        if (code === DisconnectReason.restartRequired) {
+          s.status = "restarting";
+          scheduleReconnect(sessionId, s, 500);
+          return;
+        }
+
+        s.status = "disconnected";
+        postWebhook({ event: "status-updated", sessionId, status: "disconnected", code: code || null });
+        if (s.stopped || shuttingDown) return;
         s.attempts = Math.min((s.attempts || 0) + 1, 6);
-        const wait = Math.min(5000 * 2 ** (s.attempts - 1), 60000);
-        await sleep(wait);
-        startSession(sessionId).catch(() => {});
+        const wait = Math.min(3000 * 2 ** (s.attempts - 1), 60000);
+        scheduleReconnect(sessionId, s, wait);
       }
     });
 
@@ -323,22 +489,23 @@ async function startSession(sessionId) {
     });
 
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      if (s.sock !== sock) return;
       if (type !== "notify") return;
       for (const msg of messages) {
         const key = msg.key || {};
         const remoteJid = key.remoteJid || "";
         if (remoteJid === "status@broadcast") continue;
 
-        cacheMessage(s, key, msg.message);
-
-        // Falha de decriptação desta conversa (Bad MAC / sessão fora de sincronia)
-        const failed =
-          msg.messageStubType === 2 ||
-          (!msg.message && !key.fromMe) ||
-          Boolean(msg.message?.senderKeyDistributionMessage && !msg.message?.conversation && msg.messageStubType);
-        if (failed && remoteJid) {
-          await handleDecryptFailure(sessionId, remoteJid);
+        // Só mensagens com conteúdo. Stubs (entrou no grupo, etc.) não vão ao CRM.
+        const isCiphertext = msg.messageStubType === WAMessageStubType.CIPHERTEXT;
+        if (isCiphertext && remoteJid) {
+          await handleDecryptFailure(sessionId, key.participant || remoteJid);
+          continue;
         }
+        if (!msg.message) continue;
+
+        cacheMessage(s, key, msg.message);
+        if (key.fromMe) persistSentMessage(sessionId, key, msg.message);
 
         if (remoteJid.endsWith("@g.us")) continue;
 
@@ -383,15 +550,16 @@ async function startSession(sessionId) {
 }
 
 /**
- * Bad MAC / sessão fora de sincronia com um contato específico:
- * após 3 falhas, apaga só a sessão daquele contato — ela é refeita
- * automaticamente na próxima mensagem — sem derrubar a conexão.
+ * Bad MAC / sessão Signal fora de sincronia com um contato específico:
+ * o Baileys já pede o reenvio sozinho; se falhar 3 vezes seguidas, apaga só a
+ * sessão daquele contato — ela é refeita na próxima mensagem — sem derrubar a conexão.
  */
 async function handleDecryptFailure(sessionId, jid) {
   const s = sessions.get(sessionId);
   if (!s) return;
   const count = (s.badMac.get(jid) || 0) + 1;
   s.badMac.set(jid, count);
+  logger.warn({ sessionId, jid, count }, "[signal] mensagem não decriptada (ciphertext)");
   if (count < 3) return;
   s.badMac.set(jid, 0);
   try {
@@ -406,14 +574,27 @@ async function handleDecryptFailure(sessionId, jid) {
 /* ------------------------------ erros globais ------------------------------ */
 
 process.on("unhandledRejection", (e) => logger.warn({ e: String(e?.message || e) }, "unhandledRejection"));
-process.on("uncaughtException", (e) => logger.error({ e: String(e?.message || e) }, "uncaughtException"));
+process.on("uncaughtException", (e) => logger.error({ e: String(e?.message || e), stack: e?.stack }, "uncaughtException"));
 
 /* --------------------------------- rotas ---------------------------------- */
 
+app.get("/", (_req, res) => res.json({ ok: true }));
+
 app.get("/health", (_req, res) => {
   let known = 0;
-  for (const s of sessions.values()) known += s.lidMap?.size || 0;
-  res.json({ status: "ok", uptime: process.uptime(), sessions: sessions.size, knownContacts: known });
+  const list = {};
+  for (const [id, s] of sessions) {
+    known += s.lidMap?.size || 0;
+    list[id] = { status: s.status, phone: s.phone || null, attempts: s.attempts, lastCode: s.lastDisconnectCode };
+  }
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    storage: db ? "supabase" : "disk",
+    sessions: sessions.size,
+    knownContacts: known,
+    detail: list,
+  });
 });
 
 app.post("/create-session", async (req, res) => {
@@ -421,20 +602,29 @@ app.post("/create-session", async (req, res) => {
   if (!sessionId) return res.status(400).json({ error: "sessionId required" });
   try {
     const s = await startSession(sessionId);
+    // dá até ~3s para o QR (ou a reconexão) aparecer antes de responder
+    for (let i = 0; i < 15 && s.status === "connecting"; i++) await sleep(200);
     res.json({ sessionId, status: s.status, qrcode: s.qr || null, phone: s.phone || null });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/qrcode", async (req, res) => {
   const sessionId = req.query.sessionId;
+  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
   let s = sessions.get(sessionId);
   // Depois de um restart do Render a sessão existe no banco: religa sozinha.
   if (!s) {
-    const creds = await dbRead(sessionId, "creds");
+    const creds = db ? await dbRead(sessionId, "creds") : null;
     if (!creds) return res.status(404).json({ error: "session not found" });
     s = await startSession(sessionId);
   }
   res.json({ sessionId, status: s.status, qrcode: s.qr || null, phone: s.phone || null });
+});
+
+app.get("/status", (req, res) => {
+  const s = sessions.get(req.query.sessionId);
+  if (!s) return res.status(404).json({ error: "session not found" });
+  res.json({ sessionId: req.query.sessionId, status: s.status, phone: s.phone || null, connected: s.status === "connected" });
 });
 
 app.post("/logout", async (req, res) => {
@@ -442,7 +632,8 @@ app.post("/logout", async (req, res) => {
   const s = sessions.get(sessionId);
   if (s) s.stopped = true;
   try { await s?.sock?.logout(); } catch {}
-  if (s) closeSocket(s);
+  if (s) { closeSocket(s); s.status = "logged_out"; }
+  try { await s?.auth?.wipe?.(); } catch {}
   res.json({ success: true });
 });
 
@@ -453,21 +644,39 @@ app.delete("/session/:id", async (req, res) => {
   try { await s?.sock?.logout(); } catch {}
   if (s) closeSocket(s);
   sessions.delete(sessionId);
-  try { await db.from("whatsapp_session_keys").delete().eq("session_id", sessionId); } catch {}
+  try {
+    if (s?.auth?.wipe) await s.auth.wipe();
+    else if (db) {
+      await db.from(KEYS_TABLE).delete().eq("session_id", sessionId);
+      await db.from(MSG_TABLE).delete().eq("session_id", sessionId);
+    }
+  } catch {}
   res.json({ success: true, deleted: true, exists: false });
 });
 
 app.post("/send-message", async (req, res) => {
   const { sessionId, phone, jid, message } = req.body || {};
   const s = sessions.get(sessionId);
-  if (!s?.sock || s.status !== "connected") return res.status(409).json({ error: "session not connected" });
-  let target = jid || phone || "";
-  if (!String(target).includes("@")) target = `${onlyDigits(target)}@s.whatsapp.net`;
+  if (!s?.sock || s.status !== "connected") {
+    return res.status(409).json({ error: "session not connected", status: s?.status || "unknown" });
+  }
+  let target = String(jid || phone || "");
+  if (!target.includes("@")) target = `${onlyDigits(target)}@s.whatsapp.net`;
+  if (!onlyDigits(target)) return res.status(400).json({ error: "phone/jid required" });
+  const text = String(message ?? "");
+  if (!text.trim()) return res.status(400).json({ error: "message required" });
+
   try {
-    const sent = await s.sock.sendMessage(target, { text: String(message ?? "") });
-    if (sent?.key && sent?.message) cacheMessage(s, sent.key, sent.message);
-    res.json({ success: true, messageId: sent?.key?.id || null });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const sent = await s.sock.sendMessage(target, { text });
+    if (sent?.key && sent?.message) {
+      cacheMessage(s, sent.key, sent.message);
+      await persistSentMessage(sessionId, sent.key, sent.message);
+    }
+    res.json({ success: true, messageId: sent?.key?.id || null, to: target });
+  } catch (e) {
+    logger.warn({ sessionId, target, e: e.message }, "[send] failed");
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/lid-map", (req, res) => {
@@ -505,13 +714,14 @@ app.post("/on-whatsapp", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+/* -------------------------- resume / shutdown --------------------------- */
+
 /* Religa sozinho todas as sessões já pareadas após um restart do Render. */
 async function resumeSessions() {
+  if (!db) return;
   try {
-    const { data } = await db
-      .from("whatsapp_session_keys")
-      .select("session_id")
-      .eq("key", "creds");
+    const { data, error } = await db.from(KEYS_TABLE).select("session_id").eq("key", "creds");
+    if (error) throw new Error(error.message);
     for (const row of data || []) {
       startSession(row.session_id).catch((e) =>
         logger.warn({ sessionId: row.session_id, e: e.message }, "[resume] failed"),
@@ -519,11 +729,28 @@ async function resumeSessions() {
       await sleep(1500);
     }
   } catch (e) {
-    logger.warn({ e: e.message }, "[resume] failed");
+    logger.warn({ e: e.message }, "[resume] failed — verifique se a tabela existe e as env do Supabase");
   }
 }
+
+/* Render manda SIGTERM no redeploy: fecha os sockets para a nova instância assumir limpa. */
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logger.info({ signal }, "[shutdown] encerrando sessões");
+  for (const s of sessions.values()) {
+    s.stopped = true;
+    closeSocket(s);
+  }
+  await sleep(500);
+  process.exit(0);
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 app.listen(PORT, () => {
   logger.info(`server on :${PORT}`);
   resumeSessions();
+  pruneMessageCache();
+  setInterval(pruneMessageCache, 6 * 3600 * 1000).unref();
 });
