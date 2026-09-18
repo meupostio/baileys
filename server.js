@@ -2,13 +2,16 @@
  * Baileys multi-sessão — Render (v1.1)
  *
  * O que esta versão faz:
- *  1. Credenciais e chaves Signal gravadas no Supabase (public.whatsapp_session_keys).
- *     Sem Supabase configurado, cai para disco (AUTH_DIR) e avisa no log —
- *     o servidor NUNCA derruba no boot por falta de env.
- *  2. Mensagens enviadas ficam em cache em memória E no banco
- *     (public.whatsapp_message_cache). É isso que responde ao pedido de reenvio
- *     do aparelho do contato e destrava o "Aguardando mensagem" — inclusive
- *     depois de um restart do Render.
+ *  1. Credenciais e chaves Signal persistidas. Dois modos:
+ *       - Supabase (SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY): tabela
+ *         public.whatsapp_session_keys. Pode ser um projeto Supabase próprio e
+ *         gratuito, só para este servidor.
+ *       - Disco (AUTH_DIR): use com um Persistent Disk do Render montado nesse
+ *         caminho. Sem Supabase o servidor cai neste modo sozinho e avisa no log —
+ *         NUNCA derruba no boot por falta de env.
+ *  2. Mensagens enviadas ficam em cache em memória E persistidas (banco ou disco).
+ *     É isso que responde ao pedido de reenvio do aparelho do contato e destrava
+ *     o "Aguardando mensagem" — inclusive depois de um restart do Render.
  *  3. Uma sessão por sessionId (mutex), reconexão com espera crescente e
  *     tratamento correto de cada motivo de desconexão (515, 440, 401, 403, 500).
  *  4. Falha de decriptação (CIPHERTEXT / Bad MAC) tratada por conversa.
@@ -57,9 +60,9 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   });
   logger.info("[auth] sessões persistidas no Supabase");
 } else {
-  logger.error(
-    "[auth] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY ausentes — usando disco (%s). " +
-      "No Render o disco é temporário: a sessão se perde a cada restart.",
+  logger.warn(
+    "[auth] SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY ausentes — sessões e cache de mensagens em disco (%s). " +
+      "No Render isto só funciona bem com um Persistent Disk montado em AUTH_DIR; sem disco a sessão se perde a cada restart.",
     AUTH_DIR,
   );
 }
@@ -201,8 +204,23 @@ const useAuthState = (sessionId) => (db ? useSupabaseAuthState(sessionId) : useD
 /* Necessário para responder ao "retry receipt" do aparelho do contato.          */
 /* Memória (rápido) + banco (sobrevive a restart).                                */
 
+// Fallback em disco (quando não há Supabase): um arquivo JSON por mensagem.
+const fsp = require("fs/promises");
+const pathMod = require("path");
+const msgDiskDir = (sessionId) =>
+  pathMod.join(AUTH_DIR, String(sessionId).replace(/[^a-zA-Z0-9_-]/g, "_"), "messages");
+const safeId = (id) => String(id).replace(/[^a-zA-Z0-9_-]/g, "_");
+
 async function persistSentMessage(sessionId, key, message) {
-  if (!db || !key?.id || !message) return;
+  if (!key?.id || !message) return;
+  if (!db) {
+    try {
+      const dir = msgDiskDir(sessionId);
+      await fsp.mkdir(dir, { recursive: true });
+      await fsp.writeFile(pathMod.join(dir, `${safeId(key.id)}.json`), JSON.stringify(encode(message)));
+    } catch (e) { logger.warn({ sessionId, e: e.message }, "[msgcache] disk write failed"); }
+    return;
+  }
   const { error } = await db.from(MSG_TABLE).upsert(
     {
       session_id: sessionId,
@@ -217,7 +235,13 @@ async function persistSentMessage(sessionId, key, message) {
 }
 
 async function loadSentMessage(sessionId, id) {
-  if (!db || !id) return undefined;
+  if (!id) return undefined;
+  if (!db) {
+    try {
+      const raw = await fsp.readFile(pathMod.join(msgDiskDir(sessionId), `${safeId(id)}.json`), "utf8");
+      return proto.Message.fromObject(decode(JSON.parse(raw)));
+    } catch { return undefined; }
+  }
   const { data, error } = await db
     .from(MSG_TABLE)
     .select("message")
@@ -229,8 +253,19 @@ async function loadSentMessage(sessionId, id) {
 }
 
 async function pruneMessageCache() {
-  if (!db) return;
-  const cutoff = new Date(Date.now() - MSG_CACHE_TTL_DAYS * 86400000).toISOString();
+  const cutoffMs = Date.now() - MSG_CACHE_TTL_DAYS * 86400000;
+  if (!db) {
+    for (const sid of await fsp.readdir(AUTH_DIR).catch(() => [])) {
+      const dir = pathMod.join(AUTH_DIR, sid, "messages");
+      for (const f of await fsp.readdir(dir).catch(() => [])) {
+        const p = pathMod.join(dir, f);
+        const st = await fsp.stat(p).catch(() => null);
+        if (st && st.mtimeMs < cutoffMs) await fsp.rm(p, { force: true }).catch(() => {});
+      }
+    }
+    return;
+  }
+  const cutoff = new Date(cutoffMs).toISOString();
   const { error } = await db.from(MSG_TABLE).delete().lt("created_at", cutoff);
   if (error) logger.warn({ error: error.message }, "[msgcache] prune failed");
 }
